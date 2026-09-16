@@ -1,0 +1,1219 @@
+================================================================================
+FILING-COPILOT-MCP  --  STAGED PROJECT PLAN
+================================================================================
+Generated: 2026-09-15
+Status: DRAFT FOR REVIEW
+
+--------------------------------------------------------------------------------
+CONTEXT
+--------------------------------------------------------------------------------
+A research assistant over SEC EDGAR filings that answers questions needing BOTH
+exact figures from XBRL (via SQL) and narrative explanation from filing text
+(via hybrid retrieval), routed per question and grounded in enforced citations.
+
+Portfolio project for senior DS / MLE interviews in financial services
+(credit risk, card intelligence, model risk, AML).
+
+It is equally a LEARNING project. SAS/Python production-pipeline and modeling
+background transfers directly to the structured half. Hybrid retrieval,
+embedding pipelines, MCP tooling, and LLM-system evaluation are new. The plan is
+sequenced for comprehension -- naive-first where the failure is cheap and
+instructive, correct-first where failing teaches nothing.
+
+LOCKED DECISIONS:
+  * Local-first development (DuckDB + Docker OpenSearch); AWS port is an
+    explicit stage (Stage 8), not an assumption
+  * ~20 companies x 3 years, engineered so corpus growth is a config change
+  * 10-K/10-Q now; 8-K as a bounded later stage; DEF 14A de-scoped in writing
+  * ~10-15 hrs/week; stages sized 1-4 focused days, git commit per stage
+
+
+================================================================================
+1. DESIGN ASSESSMENT  (where I push back)
+================================================================================
+
+The architecture is sound. The two-half split (SQL for figures, retrieval for
+narrative) is the right spine, and forbidding the model from doing arithmetic on
+retrieved text is the single most defensible decision in the project. Hybrid
+retrieval is correctly non-optional.
+
+1.1  YOUR OPENSEARCH COST FIGURE IS WRONG BY ~10x -- BUT THE NEWS IS GOOD
+--------------------------------------------------------------------------------
+$20-30/month is not attainable on a CLASSIC Serverless collection. The floor is
+2 OCUs (~$350/mo). Disabling redundancy for dev/test gets to ~1 OCU (~$175/mo).
+Idle.
+
+HOWEVER: NextGen collections went GA on 2026-05-28, with NO minimum OCU and
+scale-to-zero after 10 minutes idle. Vector search is one of the two supported
+collection types at GA.
+
+Consequences:
+  * Your OpenSearch Serverless choice is CORRECT and needs no substitution.
+  * Spin-up/tear-down scripting drops from financial necessity to convenience.
+  * THE TRAP: every tutorial written before mid-2026 creates a Classic
+    collection. If you follow one, you get a $175-350/month surprise.
+    Stage 8 includes a deploy-script precondition asserting collection type,
+    plus a $3 billing alarm (see section 10).
+  * Keep the "rebuild index from S3 without re-downloading or re-embedding"
+    requirement anyway -- correct design for incremental ingestion, independent
+    of cost.
+
+Sources:
+  https://aws.amazon.com/opensearch-service/pricing/
+  https://aws.amazon.com/about-aws/whats-new/2026/05/amazon-opensearch-serverless-next-generation-generally-available/
+  https://docs.aws.amazon.com/opensearch-service/latest/developerguide/serverless-scale-to-zero.html
+  https://aws.amazon.com/about-aws/whats-new/2024/06/amazon-opensearch-serverless-entry-cost-half-collection-types/
+
+
+1.2  TWO MCP TOOLS IS ONE TOO FEW
+--------------------------------------------------------------------------------
+resolve_entity / list_filings must be a third tool. Without it:
+  * The model hallucinates CIKs and accession numbers. There is no way for it
+    not to.
+  * Change detection has no mechanism to identify WHICH TWO FILINGS to diff.
+  * The adversarial "company that doesn't exist" case depends on the prompt
+    rather than on code.
+
+With it, refusal becomes deterministic: resolver returns empty -> decline, in
+code. That is the difference between "we asked the model not to hallucinate"
+and "it cannot." Not scope creep; it is what makes the other two tools usable.
+
+
+1.3  CHANGE DETECTION IS NOT RETRIEVAL
+--------------------------------------------------------------------------------
+You are right that it is the highest-value pattern and that top-k RAG handles it
+worst. But the fix isn't a better retrieval mode -- change detection NEVER
+TOUCHES THE SEARCH INDEX AT ALL. It is a set-alignment algorithm:
+
+  1. Resolve the two filings (needs tool 3)
+  2. Extract Item 1A from each
+  3. Split each into risk-factor units by subheading
+  4. Embed each unit -- embeddings as a SIMILARITY FUNCTION, not a search index
+  5. Bipartite match units across years on cosine similarity with a threshold
+  6. Unmatched-in-new = ADDED
+     Unmatched-in-old = REMOVED
+     Matched-below-high-threshold = MATERIALLY REWORDED
+  7. LLM summarizes each bucket, with citations
+
+You're right that removals are more informative than additions -- and this
+algorithm surfaces them symmetrically for free. Strong interview point: a top-k
+system STRUCTURALLY CANNOT find a removal, because there is nothing to retrieve.
+
+Calling this "a retrieval mode" will lead to building it wrong.
+
+
+1.4  THE HARD PROBLEM YOU DIDN'T LIST: XBRL TAG HETEROGENEITY
+--------------------------------------------------------------------------------
+"TOTAL DEBT" IS NOT AN XBRL TAG. Companies report under different us-gaap
+concepts -- LongTermDebt, LongTermDebtNoncurrent,
+LongTermDebtAndCapitalLeaseObligations, DebtInstrumentCarryingAmount -- and some
+use custom extension taxonomies. Your flagship query ("debt increased -- how
+much?") breaks on exactly this.
+
+Required: a declarative CONCEPT-MAPPING LAYER -- YAML mapping business concept
+-> ordered candidate tags -> resolution rule (first-available, or
+sum-of-components) -- plus a COVERAGE MATRIX report showing which companies
+resolve for which concepts.
+
+This belongs in Stage 1, not discovered in Stage 6. Your data-engineering skills
+transfer directly, and it is one of the best interview artifacts in the project
+precisely because it is the unglamorous layer that separates a system from a
+demo.
+
+
+1.5  PEER BENCHMARKING WILL BREAK UNDER PLAIN TOP-K
+--------------------------------------------------------------------------------
+Global top-k=10 over a 20-company corpus for "how do card issuers describe CECL"
+returns eight chunks from two companies. Top-k gives you CONCENTRATION, NOT
+COVERAGE.
+
+Fix: fan-out retrieval -- resolve the peer set, run one FILTERED query per
+company, take top-n each, assemble. This needs a named RETRIEVAL STRATEGY LAYER
+above the raw search tool (retrieval/strategies.py), which change detection and
+section-targeted red-flag screening also live in.
+
+
+1.6  SAGEMAKER PROCESSING IS OVERKILL AT THIS SCALE -- DO IT ANYWAY, NOT FIRST
+--------------------------------------------------------------------------------
+~20 companies x 3 years x ~1,500 chunks = ~90k chunks. On an M-series Mac with a
+137M-param model that is 20-40 minutes. SageMaker adds zero speed here.
+
+But it is a portfolio artifact and it is how you would do it at 5,000 companies.
+Resolution: write the encoder as a pure function plus a local CLI in Stage 3;
+wrap the IDENTICAL MODULE in a SageMaker Processing entrypoint in Stage 8.
+Writing SageMaker-first means debugging container builds during the stage where
+you should be learning embeddings.
+
+
+1.7  "ITEM-AWARE CHUNKING" AS POSED IS A FALSE BINARY
+--------------------------------------------------------------------------------
+Item 1A can run 30k tokens. That is not a chunk. "Item-aware" should mean: ITEM
+BOUNDARIES DETERMINE SECTIONS; SECTIONS CARRY METADATA; TOKEN-WINDOW CHUNKING
+WITH OVERLAP HAPPENS WITHIN SECTION.
+
+Recommend the hybrid -- and settle it by A/B against pure fixed-window on the
+eval set, so the recommendation is measured rather than asserted.
+
+
+1.8  "CITATION ENFORCEMENT IN CODE" NEEDS A DEFINITION OF WHAT IS ENFORCED
+--------------------------------------------------------------------------------
+Checking that a citation EXISTS is easy and nearly worthless. Four assertions,
+in increasing value:
+
+  1. Every cited chunk_id was actually in context (catches fabricated IDs)
+  2. Every sentence containing a figure carries a citation
+  3. Figures sourced from Athena carry accession + tag + period
+  4. EVERY QUOTED SPAN APPEARS VERBATIM IN THE CITED CHUNK
+     (whitespace-normalized substring match)
+
+(4) is the one that catches real hallucination. One repair loop on failure, then
+degrade to grounded-facts-only or refuse.
+
+
+1.9  WHERE "MAKE IT FAIL FIRST" EARNS ITS TIME
+--------------------------------------------------------------------------------
+WORTH FAILING FIRST:
+  * Vector-only search -> fails on "material weakness" / ticker exact match ->
+    add BM25.  [1-2 hrs]  The single most instructive failure in the project.
+    This is your answer to "why hybrid retrieval?"
+  * Global top-k on a peer question -> returns 2 companies.  [30 min]
+    Why a strategy layer exists above the search tool.
+  * Top-k RAG on change detection -> cannot find removals.  [1 hr]
+    Why the diff is an algorithm, not a query. This is the demo's punchline.
+  * Fixed-window vs item-aware chunking. Run as A/B, not sequential rewrite.
+    Makes your chunking decision measured.
+
+NOT WORTH FAILING FIRST:
+  * EDGAR throttling (getting blocked costs hours and teaches nothing)
+  * Config / secrets hygiene
+  * Citation enforcement
+  * Content-hash caching (re-embedding 90k chunks to confirm something you
+    already believe)
+
+
+================================================================================
+2. STAGED PLAN
+================================================================================
+Effort is in FOCUSED HOURS, weighted by skill transfer -- not uniform.
+At ~12 hrs/week.
+
+
+--------------------------------------------------------------------------------
+STAGE 0 -- FOUNDATIONS AND EDGAR CITIZENSHIP
+3-4 hrs  |  transfer: HIGH
+--------------------------------------------------------------------------------
+GOAL
+  A repo that can politely fetch from EDGAR and never leak a credential.
+
+DELIVERABLES
+  * pyproject.toml (py3.11, black, ruff, mypy)
+  * config.py as the single settings source (pydantic-settings, .env
+    git-ignored, .env.example committed)
+  * Throttled EDGAR client -- declared User-Agent with real contact,
+    <=10 req/sec, exponential backoff, on-disk response cache keyed by URL
+  * CLAUDE.md
+  * docs/decisions/ seeded with the decisions register as ADRs
+
+KEY DECISIONS
+  * Cache layout (data/raw/{cik}/{accession}/) -- this is the contract every
+    later stage depends on
+
+DONE WHEN
+  `fc fetch-submissions --ticker SYF` returns cached JSON on second run with
+  zero network calls, and no secret or bucket name appears in tracked files.
+
+
+--------------------------------------------------------------------------------
+STAGE 1 -- STRUCTURED LAYER: XBRL -> PARQUET -> SQL
+12-16 hrs  |  transfer: VERY HIGH
+--------------------------------------------------------------------------------
+GOAL
+  Answer any pure-structured question correctly, with the restatement and
+  fiscal-period traps handled explicitly.
+
+DELIVERABLES
+  * companyfacts.zip bulk download -> flattened Parquet, partitioned
+    cik/fiscal_year. One row per fact-observation carrying:
+    cik, tag, taxonomy, unit, start, end, val, fy, fp, form, filed, accn
+  * CONCEPT-MAPPING LAYER (see 1.4): concepts.yaml + resolver +
+    COVERAGE MATRIX REPORT
+  * RESTATEMENT HANDLING: as_reported (earliest `filed` for the period) vs
+    as_restated (latest `filed`); default as_restated; tool response always
+    carries a `basis` field and a `restated: true/false` flag when the two
+    differ
+  * FISCAL NORMALIZATION: derive cal_year / cal_quarter from period end; label
+    a duration fact by the calendar year containing the majority of its span;
+    emit fiscal_alignment_warning when compared entities' period ends differ by
+    more than 45 days
+  * SqlBackend protocol + DuckDB implementation (3-4 methods, deliberately
+    narrow -- this is what contains the Stage 8 port)
+  * CLI: fc financials --ticker SYF --concept total_revenue --fy 2024
+
+KEY DECISIONS
+  * Restatement default
+  * Fiscal labeling rule
+  * How narrow the backend protocol can be while still supporting peer
+    comparison
+
+DONE WHEN
+  The coverage matrix shows total_debt, total_revenue, and
+  allowance_for_credit_losses resolving for >=18 of 20 companies; a query mixing
+  a December-FYE and a September-FYE filer returns a visible alignment warning;
+  a restated period returns both bases on request.
+
+  >> DO NOT SKIP THE COVERAGE MATRIX. It is the cheapest early probe for the
+     highest-likelihood data risk in the project.
+
+
+--------------------------------------------------------------------------------
+STAGE 2 -- FILING TEXT: ACQUISITION, SECTIONING, CHUNKING
+14-20 hrs  |  transfer: MEDIUM  |  *** HIGHEST VARIANCE STAGE ***
+--------------------------------------------------------------------------------
+GOAL
+  Turn 60 messy HTML filings into clean, section-attributed, citable chunks.
+
+DELIVERABLES
+  * Filing index from submissions.json -> download primary documents
+    (throttled, cached)
+  * ASSERT INDEX COMPLETENESS -- filings.recent caps at ~1000 rows and is NOT
+    the full history; older filings sit in the paginated files under
+    filings.files (no URL builder exists for these yet). A heavy Form 4 filer
+    pushes 10-Ks out of the window silently. Compare the 10-K count found
+    against the configured corpus years and FAIL LOUDLY, naming the
+    filings.files page to fetch, rather than building a short corpus.
+    Measured: COF recent reaches back to 2021-02, SYF only to 2022-02.
+  * HTML -> normalized text (strip tables to structured placeholders, preserve
+    headings)
+  * ITEM SECTIONER -- regex over normalized text with a monotonic-ordering
+    constraint and TOC suppression, extracting Items 1, 1A, 3, 7, 7A, 8, 9A
+  * Two chunkers behind one interface (fixed_window, item_aware), both emitting:
+    Chunk(chunk_id, cik, accession, form, period_end, item, section_path,
+          char_start, char_end, text)
+  * PARSER COVERAGE REPORT
+
+KEY DECISIONS
+  * Chunk size and overlap (start 800 tokens / 15% overlap)
+  * Table handling
+  * Whether to carry a CONTEXTUAL PREFIX on each chunk (company, form, period,
+    item) before embedding -- recommend YES, see Anthropic's contextual
+    retrieval work
+
+DONE WHEN
+  Items 1A/7/9A are located with plausible lengths in >=90% of the 60 filings,
+  and every failure is LISTED, not silently empty. char_start/char_end
+  round-trip back to the source document -- this is what makes citations
+  verifiable later.
+
+  >> THIS IS THE STAGE MOST LIKELY TO BLOW ITS ESTIMATE. Probe on day one: run
+     the sectioner over 10 filings from 10 DIFFERENT filers. If under 80%
+     succeed, double the budget and say so rather than grinding.
+
+
+--------------------------------------------------------------------------------
+STAGE 3 -- EMBEDDINGS AND LOCAL INDEX
+8-10 hrs  |  transfer: LOW-MEDIUM
+--------------------------------------------------------------------------------
+GOAL
+  A searchable local index you can rebuild incrementally.
+
+DELIVERABLES
+  * Encoder around nomic-embed-text-v1.5 as a pure function
+  * CONTENT-HASH-KEYED EMBEDDING CACHE (only new/changed chunks get embedded)
+  * OpenSearch in Docker
+  * Index mapping with knn_vector + BM25-analyzed text + filterable metadata
+    (cik, form, period_end, item)
+  * build_index driven by a MANIFEST so the index rebuilds from stored artifacts
+    without re-downloading or re-embedding
+
+KEY DECISIONS
+  * Embedding model
+  * Dimensionality (nomic supports Matryoshka truncation -- 768 default,
+    256 viable)
+  * Normalization
+
+DONE WHEN
+  Full rebuild from manifest runs in minutes with zero re-embedding, and
+  re-running ingestion after changing one filing re-embeds only that filing's
+  chunks.
+
+  >> THE SPECIFIC TRAP HERE: nomic-embed-text-v1.5 requires task prefixes --
+     "search_document:" when embedding corpus chunks, "search_query:" when
+     embedding queries. Omitting them degrades retrieval SILENTLY. No error,
+     just quietly worse results. Write a test that asserts the prefixes are
+     applied.
+
+  >> YOU ALREADY HAVE nomic-embed-text PULLED IN OLLAMA -- which makes it easy
+     to assume prefixes are handled for you. Verify whether Ollama applies them
+     automatically or expects you to supply them, BEFORE you embed 90k chunks.
+     Having the model installed is exactly the condition under which this trap
+     goes unnoticed.
+
+
+--------------------------------------------------------------------------------
+STAGE 4 -- RETRIEVAL, BUILT BY DELIBERATE FAILURE
+16-20 hrs  |  transfer: LOW  |  *** MOST LEARNING ***
+--------------------------------------------------------------------------------
+GOAL
+  Hybrid retrieval you can defend, measured rather than eyeballed.
+
+SEQUENCE -- follow this order, it is the point of the stage:
+  1. Vector-only search. Query "material weakness" and a ticker symbol.
+     WATCH IT FAIL. Write down what you saw.
+  2. Add BM25. Same queries. Note what changed.
+  3. Fuse with RECIPROCAL RANK FUSION -- score each doc as
+     sum over lists of 1/(k + rank_i), with k=60. Rank-based, so no score
+     normalization needed -- which is exactly why it is preferred over weighted
+     score blending.
+  4. BUILD THE RETRIEVAL EVAL HARNESS *HERE*, BEFORE THE AGENT EXISTS.
+     Label gold chunks for ~30 questions. Measure recall@k, MRR, nDCG@10.
+  5. Only now: A/B fixed_window vs item_aware chunking on those metrics.
+     Let the numbers decide 1.7.
+  6. Metadata filters + STRATEGY LAYER: fan_out_peers, section_targeted.
+
+DONE WHEN
+  You can state, WITH NUMBERS, what hybrid buys over vector-only on your eval
+  set, and which chunker won.
+
+  >> TIMEBOX FUSION TUNING. Fix k=60 and do not tune weights until the eval
+     harness exists. Tuning retrieval by eyeballing results is the most common
+     way to spend a week and end up worse.
+
+
+--------------------------------------------------------------------------------
+STAGE 5 -- MCP LAYER, ROUTER, CITATION ENFORCEMENT
+14-18 hrs  |  transfer: LOW
+--------------------------------------------------------------------------------
+GOAL
+  Three tools, correct routing, citations enforced in code.
+
+DELIVERABLES
+  * MCP server exposing resolve_entity, query_financials, search_filings
+  * Tool descriptions written as ROUTER CONTRACTS (the description IS the
+    routing logic)
+  * A system prompt that forbids arithmetic on retrieved text
+  * CITATION VALIDATOR implementing the four assertions in 1.8, with one repair
+    loop
+  * Refusal path when the resolver returns empty
+
+DRIVE IT FROM CLAUDE CODE, NOT A BESPOKE AGENT LOOP
+  Register the server in .mcp.json and iterate inside a Claude Code session.
+  Three reasons: it costs nothing at the margin (subscription already paid --
+  see section 10), it is what MCP is actually for, and "here is my server
+  running live in a real MCP client" is a better demo than a hand-rolled chat
+  wrapper. Write no agent-loop code unless a reviewer needs to see one.
+
+KEY DECISIONS
+  * Router mechanism (see register -- recommend LLM tool choice + deterministic
+    guardrails, NOT a trained classifier)
+  * Citation marker format
+  * Repair-loop budget
+
+DONE WHEN
+  The adversarial non-existent-company question is declined without an LLM being
+  asked to be honest; a synthetically corrupted quote is caught by the
+  validator; a "how much" question that routes only to search_filings fails an
+  assertion.
+
+
+--------------------------------------------------------------------------------
+STAGE 6 -- CHANGE DETECTION
+10-14 hrs  |  transfer: MEDIUM  |  *** THE DIFFERENTIATOR ***
+--------------------------------------------------------------------------------
+GOAL
+  Implement section 1.3.
+
+DELIVERABLES
+  * retrieval/diff.py -- the bipartite-matching algorithm
+  * Similarity thresholds calibrated on a known filing pair
+  * Output buckets (added / removed / materially reworded / unchanged) with
+    citations to BOTH filings
+  * An MD&A tone-shift variant over Item 7
+
+KEY DECISIONS
+  * Matching algorithm (greedy vs Hungarian -- greedy is fine and explainable)
+  * The two thresholds
+  * Whether "reworded" needs an LLM summary or a diff view
+
+DONE WHEN
+  On a filing pair where you have MANUALLY verified the changes, the tool finds
+  EVERY REMOVAL. Removals are the correctness bar, because they are what a
+  similarity system cannot find.
+
+  >> BEFORE BUILDING IT, spend 30 minutes trying to answer the same question
+     with top-k RAG. It will return similar-looking risk factors from both years
+     and confidently tell you nothing was removed. That demonstration is the
+     strongest slide in your demo.
+
+
+--------------------------------------------------------------------------------
+STAGE 7 -- EVAL SUITE AND CI
+12-16 hrs  |  transfer: MEDIUM
+--------------------------------------------------------------------------------
+GOAL
+  CI that tests YOUR INVARIANTS deterministically, and samples model behavior
+  separately.
+
+Full detail in section 4.
+
+DELIVERABLES
+  * ~70-question eval set
+  * ZERO-LLM CI (Tier A retrieval metrics + HHEM groundedness + guardrail unit
+    tests against synthetic traces)
+  * Frozen fixtures
+  * GitHub Actions against Docker OpenSearch and DuckDB -- NEVER LIVE AWS
+  * A manual, batched router check run ~10x over the project
+  * A local qwen2.5:14b correctness judge, with a JUDGE-VALIDATION RUN against
+    20 hand-labeled answers
+
+HARDWARE CONSTRAINT -- 16GB M1 PRO BINDS BEFORE COST DOES
+  qwen2.5:14b is 9GB, and judging a RAG answer means ~15k tokens of context plus
+  KV cache. You CANNOT run Docker OpenSearch (2-4GB) and the 14B judge
+  simultaneously. Sequence them: build the index, stop the container, then
+  judge. Budget 30-60s per judgment -> ~45 min for a 70-question run. Fine
+  nightly, impossible per-PR -- which is the other reason groundedness belongs
+  on HHEM (600MB, CPU, milliseconds) rather than on a generative judge.
+
+THE DESIGN PRINCIPLE THE BUDGET FORCED (which is also the better answer)
+  CI asserts that YOUR VALIDATOR rejects an uncited numeric claim -- that is
+  your code, testable with a synthetic trace for free. Whether Claude picks the
+  right tool is Anthropic's behavior; you SAMPLE that, you don't gate on it.
+  Gating CI on a stochastic system produces flaky tests people learn to ignore.
+
+DONE WHEN
+  A deliberate regression (break the RRF fusion) turns CI red, and the full
+  suite runs with ZERO API CALLS.
+
+
+--------------------------------------------------------------------------------
+STAGE 8 -- AWS PORT
+12-16 hrs  |  transfer: MEDIUM-HIGH
+--------------------------------------------------------------------------------
+GOAL
+  The cloud-native version, behind unchanged interfaces.
+
+DELIVERABLES
+  * Parquet -> S3
+  * Glue catalog with partition projection
+  * AthenaBackend (async submit/poll/fetch, Trino dialect)
+  * CONFORMANCE TEST SUITE RUN AGAINST BOTH SQL BACKENDS
+  * AossBackend (SigV4)
+  * SageMaker Processing wrapper around the Stage 3 encoder (RUN ONCE to prove
+    it works, then go back to local)
+  * Deploy script ASSERTING A NEXTGEN COLLECTION
+  * Teardown script
+
+BILLING GUARDRAILS -- SET THESE *BEFORE* THE FIRST DEPLOY, NOT AFTER
+  * AWS Budget with an ACTION, not just a notification, at $3
+  * Verify collection type in the console BY EYE immediately after creation --
+    do not trust the script alone the first time
+  * Run teardown even though NextGen makes it optional -- a forgotten
+    PROVISIONED domain does the same damage as a Classic collection
+
+  A Classic collection is $175-350/month: 17-35x the entire project budget, in
+  month one. This one-line assertion is the highest-leverage code in the repo.
+
+WHY THE PORT IS REAL WORK, NOT FREE
+  * DIALECT: Athena is Trino/Presto (date_diff('day', a, b), CAST, ARRAY[...]);
+    DuckDB is Postgres-flavored (datediff, different date arithmetic). Any
+    non-trivial date logic -- and fiscal-period normalization is all date logic
+    -- needs translating.
+  * EXECUTION MODEL: DuckDB is synchronous, in-process. Athena is submit ->
+    poll -> fetch result from an S3 staging bucket. A different client shape,
+    not a connection-string swap.
+  * CATALOG: Athena needs a Glue table with registered partitions (or partition
+    projection). DuckDB just reads the Parquet.
+  * COST MODEL: Athena bills per byte scanned, so partition pruning stops being
+    an optimization and becomes correctness-of-the-bill.
+  * OPENSEARCH: local Docker uses basic auth and the full plugin surface;
+    Serverless uses SigV4 and has API differences around search pipelines and
+    index settings -- which is exactly where hybrid search lives.
+
+DONE WHEN
+  The conformance suite passes identically on DuckDB and Athena, and the demo
+  runs end-to-end on AWS.
+
+
+--------------------------------------------------------------------------------
+STAGE 9 -- 8-K EXTENSION  (OPTIONAL -- FIRST CUT CANDIDATE)
+6-8 hrs  |  transfer: HIGH
+--------------------------------------------------------------------------------
+Items 4.01 (auditor change), 4.02 (non-reliance / restatement), 5.02 (executive
+departure). 8-Ks are short, so ingestion is cheap; the win is that red-flag
+screening stops being limited to Item 9A.
+
+
+--------------------------------------------------------------------------------
+STAGE 10 -- DEMO, DOCS, ARCHITECTURE WRITEUP
+6-10 hrs  |  transfer: HIGH
+--------------------------------------------------------------------------------
+  * The demo script in section 5 as an executable notebook or CLI transcript
+  * README.md leading with the flagship query
+  * docs/architecture.md
+  * ADRs finalized
+  * A WRITTEN DE-SCOPE NOTE FOR DEF 14A so it reads as a decision
+
+
+--------------------------------------------------------------------------------
+EFFORT SUMMARY
+--------------------------------------------------------------------------------
+  STAGE                          HOURS      TRANSFER
+  ----------------------------------------------------------
+  0   Foundations                 3-4       High
+  1   Structured layer           12-16      Very high
+  2   Filing text                14-20      Medium      <-- riskiest
+  3   Embeddings + index          8-10      Low-med
+  4   Retrieval                  16-20      Low         <-- most learning
+  5   MCP + grounding            14-18      Low
+  6   Change detection           10-14      Medium      <-- differentiator
+  7   Eval + CI                  12-16      Medium
+  8   AWS port                   12-16      Med-high
+  9   8-K (optional)              6-8       High
+  10  Demo + docs                6-10       High
+  ----------------------------------------------------------
+  TOTAL                         114-152     ~9-13 weeks @ 12 hrs/wk
+
+CUT LINE IF A DEADLINE APPEARS:
+  Stages 0-6 + a reduced Stage 7 (Tier A only) + Stage 10 = ~85-110 hrs.
+  Cut Stage 9 first. KEEP STAGE 8 -- "I built it on AWS" matters for your target
+  roles, and the port is contained by design.
+
+
+================================================================================
+3. DECISIONS REGISTER
+================================================================================
+
+D1  FILING SCOPE
+    Options:  10-K/10-Q only | +8-K | +DEF 14A
+    RECOMMEND: 10-K/10-Q, +8-K at Stage 9, DEF 14A de-scoped in writing
+    Why: Periodic reports carry 5 of 6 non-adversarial archetypes. 8-K is cheap
+    and unlocks auditor changes / restatements / departures. DEF 14A is
+    table-heavy parsing for a non-primary persona -- a week for little interview
+    value.
+
+D2  CHUNKING
+    Options:  Fixed-window | Pure item | Hybrid
+    RECOMMEND: Hybrid -- item boundaries -> sections; token-window + overlap
+    within section
+    Why: Item 1A is 30k tokens -- not a chunk. Section metadata is what makes
+    diffing and targeted retrieval work. Settle the A/B with eval numbers
+    (Stage 4.5), not assertion.
+
+D3  RESTATEMENT CONVENTION
+    Options:  As-reported | As-restated | Both
+    RECOMMEND: Default as-restated (latest `filed`); always return `basis`;
+    flag divergence
+    Why: "What was 2023 revenue?" colloquially means today's best answer. But
+    silently picking one is the failure mode -- the flag is the actual
+    deliverable.
+
+D4  FISCAL NORMALIZATION
+    Options:  Calendar-normalize | Surface mismatch | Both
+    RECOMMEND: Both -- derive cal_year by majority-of-span; emit warning when
+    period ends differ >45 days
+    Why: Relabeling alone is a lie for Apple's FY2024. Warning alone makes every
+    cross-company query manual. TTM recomposition from quarterly data is the
+    stretch goal -- note it, don't build it.
+
+D5  ROUTER MECHANISM
+    Options:  LLM tool choice | Trained classifier | Rules
+    RECOMMEND: LLM tool choice + deterministic guardrails
+    Why: A classifier needs labeled data you don't have and fails on novel
+    phrasings. Rules can't handle archetype 3. Put the rigor in GUARDRAILS:
+    resolver-gated refusal, and a validator rejecting any numeric claim not
+    traceable to query_financials. The tool description IS the router -- write
+    it as a contract.
+
+D6  CHANGE DETECTION
+    Options:  Top-k RAG | Text diff | Embedding-matched section alignment
+    RECOMMEND: Section alignment + bipartite matching (see 1.3)
+    Why: Top-k structurally cannot find removals. Raw text diff drowns in
+    boilerplate rewording. Embedding similarity with thresholds separates
+    "reworded" from "removed" -- which is the distinction that matters.
+
+D7  CITATION ENFORCEMENT
+    Options:  Prompt-only | Marker presence | Verbatim span validation
+    RECOMMEND: All four assertions in 1.8, one repair loop, then degrade or
+    refuse
+    Why: Marker presence is theater. Verbatim-span substring matching against
+    the cited chunk is what actually catches hallucination, and it is ~40 lines
+    of code.
+
+D8  THIRD MCP TOOL
+    Options:  Two tools | Three
+    RECOMMEND: Three -- add resolve_entity / list_filings
+    Why: Without it the model invents CIKs, change detection has no filing
+    selector, and refusal is prompt-dependent (see 1.2).
+
+D9  EMBEDDING MODEL
+    Options:  nomic-embed-text-v1.5 | mxbai-embed-large-v1
+    RECOMMEND: nomic-embed-text-v1.5
+    Why: 8192-token context suits long filing prose; Matryoshka truncation lets
+    you trade dimensions for index size later without re-embedding.
+    Cost: mandatory task prefixes (Stage 3 trap).
+
+D10 FUSION
+    Options:  Weighted score blend | RRF
+    RECOMMEND: RRF, k=60
+    Why: Rank-based, so no score normalization across incomparable BM25/cosine
+    scales. Fewer knobs to overtune before you have an eval set.
+
+D11 LOCAL VS AWS   [DECIDED]
+    RECOMMEND: Local-first, port at Stage 8
+    Why: Fast iteration during the learning-heavy stages; free CI; no spend
+    while experimenting. Port contained by a 3-4 method interface + conformance
+    suite.
+
+D12 COLLECTION TYPE
+    Options:  Classic | NextGen
+    RECOMMEND: NextGen, asserted in the deploy script
+    Why: Scale-to-zero vs a $175-350/mo idle floor (see 1.1). Pre-2026 tutorials
+    will steer you wrong.
+
+
+================================================================================
+4. EVALUATION PLAN
+================================================================================
+
+EVAL SET -- ~70 QUESTIONS
+--------------------------------------------------------------------------------
+  ARCHETYPE            COUNT   PRIMARY ASSERTION
+  ------------------------------------------------------------------------
+  Pure structured       12     Exact value + correct `basis` + alignment
+                               warning where applicable
+  Pure unstructured     12     recall@10 against gold chunks
+  Hybrid sequential     12     Tool sequence + figure traceable to
+                               query_financials
+  Change detection      10     Added/removed sets vs manual labels --
+                               REMOVALS WEIGHTED DOUBLE
+  Red-flag screening     8     Correct positive AND NEGATIVE identification
+  Peer benchmarking      8     Company coverage >= N distinct issuers
+                               (catches concentration)
+  Adversarial            8     Refusal fires; ambiguous questions use both
+                               tools
+
+
+THREE ASSERTION TIERS -- REVISED FOR A $10 TOTAL BUDGET
+--------------------------------------------------------------------------------
+TIER A -- DETERMINISTIC. EVERY PR. NO LLM, NO AWS.  COST: $0
+  Retrieval metrics against labeled gold chunk IDs; golden SQL results against
+  frozen DuckDB Parquet; citation-validator unit tests; resolver behavior.
+  Pure math -- cosine similarity, set comparison, substring matching. This is
+  the most valuable tier for a portfolio project because it is what
+  demonstrates eval rigor, and it costs nothing.
+
+  METRICS DEFINED:
+    recall@k -- fraction of gold chunks appearing in the top k.
+    MRR (Mean Reciprocal Rank) -- average of 1/(rank of first relevant result).
+      Rewards getting one right answer to the top.
+    nDCG@10 -- discounted cumulative gain normalized against ideal ordering.
+      Rewards ranking ALL relevant results well, not just the first.
+
+  ALSO IN TIER A: GROUNDEDNESS VIA HHEM-2.1-OPEN
+    "Is this answer supported by these retrieved chunks?" is a natural-language
+    ENTAILMENT problem, not a judgment problem -- so use a purpose-built
+    cross-encoder instead of a generative judge.
+
+    HHEM-2.1-Open scores 0-1 for "response evidenced by premise", runs in UNDER
+    600MB RAM at ~1.5s per 2k-token input ON CPU, and is deterministic. For this
+    narrow task it is MORE reliable than a 14B generalist, and it never has an
+    opinion about style. Assert a minimum groundedness score per answer; fail
+    the build below threshold.
+
+    https://huggingface.co/vectara/hallucination_evaluation_model
+
+    This is an UPGRADE to the plan, not a budget workaround: groundedness moves
+    from a nightly, non-blocking, paid tier into a deterministic per-PR gate
+    that costs nothing.
+
+TIER B -- SPLIT IN TWO.
+
+  B1 -- GUARDRAIL UNIT TESTS. EVERY PR. NO LLM.  COST: $0
+    Feed SYNTHETIC TRACES to the validator and assert it behaves:
+      - an uncited numeric claim is rejected
+      - a fabricated chunk_id is caught
+      - a quote absent from its cited chunk fails
+      - a resolver miss produces a refusal
+    This tests YOUR CODE, runs in milliseconds, and never flakes.
+
+  B2 -- LIVE ROUTER SAMPLING. MANUAL, ~10x OVER THE PROJECT.
+        Haiku 4.5 + Batch API.  COST: ~$0.30
+    Assert REQUIRED TOOLS PRESENT and FORBIDDEN TOOLS ABSENT -- not exact
+    arguments, which are too brittle. TRIM THE INPUT: to check tool choice you
+    need system prompt + tool defs + question (~2.5k tokens), NOT the retrieved
+    chunks fed back. The load-bearing assertion: a question containing a
+    quantity must not be answered without query_financials in the trace.
+
+TIER C -- ANSWER CORRECTNESS. LOCAL MODEL VIA OLLAMA.
+          NIGHTLY, NON-BLOCKING.  COST: $0
+  Groundedness is handled in Tier A, so what remains for a generative judge is
+  CORRECTNESS AND RELEVANCE -- did it answer the question, and is the answer
+  right. Use qwen2.5:14b through Ollama (already installed locally).
+  Non-blocking, because a 14B judge is noisier than Opus and you should not gate
+  a build on it.
+
+  VALIDATE THE JUDGE BEFORE TRUSTING IT -- THIS STEP IS NOT OPTIONAL.
+    Hand-label ~20 answers yourself, then measure agreement with the local
+    judge. If agreement is poor, you have learned cheaply that the judge is
+    noise and should be ignored rather than reported. Skipping this is how
+    people end up with numbers that look rigorous and track nothing.
+
+    INTERVIEW ANSWER: "I validated my judge against human labels before I
+    trusted its numbers." That sentence is worth more than any score the judge
+    produces.
+
+  KNOWN PATHOLOGIES OF SMALL GENERATIVE JUDGES -- watch for all three when you
+  validate:
+    * POSITION BIAS     -- favoring whichever answer came first
+    * VERBOSITY BIAS    -- rewarding longer answers regardless of quality
+    * SELF-PREFERENCE   -- favoring output from the same model family
+
+  MANUAL REVIEW SURVIVES.
+    Spot-check ~10 answers on the held-out set before the demo regardless of
+    what the automated tiers say.
+
+  >> WHY THE SPLIT IS BETTER ENGINEERING, NOT JUST CHEAPER.
+     CI should gate on your invariants; model behavior you sample. Gating CI on
+     a stochastic system produces flaky tests that people learn to ignore, and
+     a red build nobody trusts is worse than no build.
+     Interview answer for Tier C's absence: "LLM-judge evaluation wasn't
+     justified at this corpus size -- I evaluated retrieval quantitatively and
+     answer quality qualitatively on a held-out set." A stated cost/value
+     tradeoff reads better than an unexamined one.
+
+
+CI MECHANICS -- FIXTURES, NEVER LIVE AWS
+--------------------------------------------------------------------------------
+  * OpenSearch runs as a Docker SERVICE CONTAINER in GitHub Actions, so hybrid
+    search in CI is REAL, not mocked
+  * Frozen ~3,000-chunk eval corpus; embeddings stored as FLOAT16 -> ~4.6MB,
+    small enough to commit directly
+    (the full 90k x 768 float32 corpus is ~276MB -- DO NOT COMMIT THAT)
+  * Structured fixtures are committed Parquet read by DuckDB
+  * Tier B calls the live model API with a low token budget; skipped on forks
+    without secrets
+
+
+GUARDING AGAINST EVAL OVERFIT
+--------------------------------------------------------------------------------
+  Write questions from the persona list BEFORE looking at retrieval results.
+  Hold 20% as a blind set, run only before the demo. Writing eval questions
+  while staring at retrieved chunks is how you produce an eval that only
+  measures what you already built.
+
+
+================================================================================
+5. DEMO SCRIPT -- CREDIT-RISK PERSONA, ESCALATING
+================================================================================
+Framing: "I'm assessing Synchrony Financial as a counterparty. Will they exist
+in 18 months, and can they service their obligations?"
+
+SETUP, BEFORE YOU SHARE YOUR SCREEN
+  NextGen scale-to-zero means a ~10-SECOND COLD START on the first query after
+  idle. Send a throwaway query to warm the collection first, or you open the
+  demo with ten seconds of silence. Run the demo through Claude Code with the
+  MCP server registered -- no bespoke UI to build or maintain.
+
+  1. "What was Synchrony's total revenue for FY2024?"
+     -> Clean structured routing; citation carries accession + tag + period
+
+  2. "Compare total revenue for FY2024 across SYF and [a September-FYE filer]."
+     -> THE FISCAL-ALIGNMENT TRAP, CAUGHT AND SURFACED -- not silently wrong
+
+  3. "What did Synchrony disclose about customer concentration risk?"
+     -> Pure retrieval. Say out loud that "concentration" is an exact-match term
+        vector-only search underweights -- this is where you tell the hybrid
+        story
+
+  4. *** "Synchrony's allowance for credit losses increased in 2024 -- by how
+     much, and what did management say drove it?" ***
+     -> THE FLAGSHIP. Figure from SQL, narrative from retrieval, two citation
+        types in one answer, no LLM arithmetic
+
+  5. "How do major card issuers describe their CECL allowance methodology?"
+     -> Fan-out retrieval. Mention that naive top-k returns two companies --
+        then show coverage across five
+
+  6. *** "Which risk factors did Synchrony add or remove in the FY2024 10-K vs
+     FY2023?" ***
+     -> THE DIFFERENTIATOR. Lead with a REMOVAL. Explain why top-k structurally
+        cannot find it
+
+  7. "Any material weakness or going-concern language across my portfolio?"
+     -> Section-targeted screening returning credible NEGATIVES -- a system that
+        can say "no" is a system you can trust
+
+  8. "What was Northgate Financial Holdings' 2024 revenue?" (does not exist)
+     -> Resolver returns empty -> declines in code.
+        Then: "Tell me about COF's debt" -> ambiguous, uses both tools
+
+QUERIES 4 AND 6 ARE THE ONES THAT LAND. BUILD TOWARD THEM.
+
+
+================================================================================
+6. RISK LIST
+================================================================================
+
+  RISK                                    P     IMPACT   CHEAPEST EARLY PROBE
+  ------------------------------------------------------------------------------
+  Item parsing under-delivers on         High   High     STAGE 2, DAY ONE: run
+  inconsistent filer HTML                                the sectioner over 10
+                                                         filings from 10
+                                                         different filers.
+                                                         <80% -> double the
+                                                         budget openly
+
+  XBRL tag heterogeneity breaks the      High   Medium   END OF STAGE 1:
+  flagship query                                         coverage matrix across
+                                                         all 20 companies.
+                                                         total_debt resolving
+                                                         for <15/20 -> redesign
+                                                         the mapping
+
+  Eval labeling gets skipped because     High   High     Label 10 questions in
+  it is tedious                                          Stage 4 and TIME IT.
+                                                         Multiply by 7. If that
+                                                         number is
+                                                         unacceptable, cut the
+                                                         eval set, don't cut
+                                                         labeling quality
+
+  Fusion-tuning rabbit hole              Med    High     Hard rule: no weight
+                                                         tuning before Tier A
+                                                         exists. Fix k=60
+
+  Classic-collection cost surprise       Low    High     Deploy-script
+                                                         assertion on collection
+                                                         type + $3 billing
+                                                         alarm, both written in
+                                                         Stage 8 BEFORE the
+                                                         first deploy
+
+  Change-detection thresholds don't      Med    Medium   Calibrate on one
+  cleanly separate reworded from                         manually-labeled filing
+  removed                                                pair before
+                                                         generalizing
+
+  Scope creep into DEF 14A / more        Med    Medium   Cut line written into
+  companies                                              CLAUDE.md
+
+  Athena dialect surprises during port   Med    Low      Conformance suite
+                                                         written in Stage 1, run
+                                                         against DuckDB from
+                                                         day one
+
+GENUINELY HARD, IN ORDER:
+  1. Item parsing -- unglamorous and it gates everything downstream
+  2. Eval labeling discipline
+  3. Change-detection threshold calibration
+Everything else is tractable engineering.
+
+
+================================================================================
+7. LEARNING PATH
+================================================================================
+
+STAGE 0 -- API CITIZENSHIP
+  Explain: why bulk endpoints beat per-filing requests
+  Mistake: hammering EDGAR and getting IP-blocked mid-ingestion
+
+STAGE 1 -- FINANCIAL DATA IS NOT CLEAN DATA
+  Explain: why "2023 revenue" has more than one right answer
+  Mistake: assuming a tag name is a business concept
+
+STAGE 2 -- CHUNKING / OVERLAP
+  CHUNKING: splitting documents into retrievable units.
+  OVERLAP: repeating N tokens between adjacent chunks so a sentence spanning a
+    boundary survives.
+  Explain: why chunk boundaries determine the retrieval ceiling
+  Mistake: chunks too small, no overlap, tables shredded, no section metadata
+
+STAGE 3 -- EMBEDDINGS / MATRYOSHKA
+  EMBEDDINGS: dense semantic vectors.
+  MATRYOSHKA: trained so leading dimensions carry most signal, enabling
+    truncation.
+  Explain: why you cache on content hash
+  Mistake: FORGETTING NOMIC'S TASK PREFIXES -- silent degradation, no error
+
+STAGE 4 -- BM25 / HYBRID / RRF / RERANKING
+  BM25: lexical relevance scoring on term frequency + inverse document frequency
+    + length normalization.
+  HYBRID SEARCH: combining lexical and semantic.
+  RRF: rank-based fusion avoiding score normalization.
+  RERANKING: a cross-encoder re-scoring top-k with full query-document
+    attention.
+  Explain: "WHY HYBRID RETRIEVAL?" -- answered with your own measured numbers,
+    not received wisdom
+  Mistake: tuning by eyeballing; global top-k for multi-entity questions;
+    treating cosine thresholds as absolute rather than model- and
+    corpus-relative
+
+STAGE 5 -- TOOL ROUTING / GROUNDING AS A CODE-LEVEL INVARIANT
+  Explain: why the tool description IS the router
+  Mistake: believing "the model cited something" means "the citation supports
+    the claim"
+
+STAGE 6 -- SET ALIGNMENT VS SIMILARITY SEARCH
+  Explain: why a retrieval system structurally cannot find a removal
+  Mistake: reaching for a better query when you need a different algorithm
+
+STAGE 7 -- RAG EVALUATION / ENTAILMENT vs JUDGMENT
+  ENTAILMENT: does passage P support claim C? A narrow task a small
+    cross-encoder does better than a large generative model.
+  LLM-AS-JUDGE: a model scoring another model's output. Powerful, biased,
+    and worthless until validated against human labels.
+  Explain: "HOW DO YOU EVALUATE A RAG SYSTEM?" -- separate retrieval quality
+    from generation quality, because they fail differently and you cannot fix
+    what you cannot localize; and separate groundedness (entailment, cheap and
+    deterministic) from correctness (judgment, expensive and noisy)
+  Mistake: writing eval questions while looking at retrieved chunks; trusting a
+    judge you never validated; gating CI on a stochastic scorer
+
+STAGE 8 -- PORTABILITY AS A DESIGN CONSTRAINT
+  Explain: why the interface was narrow on purpose
+  Mistake: assuming SQL is SQL
+
+
+READING LIST -- SHORT, HIGH SIGNAL
+--------------------------------------------------------------------------------
+  * Cormack, Clarke & Buettcher (2009), "Reciprocal Rank Fusion outperforms
+    Condorcet..." -- two pages, read it fully before Stage 4
+  * Robertson & Zaragoza, "The Probabilistic Relevance Framework: BM25 and
+    Beyond" -- skim section 3 only
+  * Anthropic, "Introducing Contextual Retrieval" -- directly applicable to the
+    Stage 2 chunk-prefix decision
+  * OpenSearch hybrid search / search pipeline docs -- Stage 4, and the Stage 8
+    API-gap check
+  * nomic-embed-text-v1.5 model card -- read the task-prefix section twice
+  * MCP specification, tool design section -- Stage 5
+  * Cohen, Malloy & Nguyen (2020), "Lazy Prices," Journal of Finance --
+    changes in 10-K text predict returns. The academic justification for
+    Stage 6, and a strong interview reference
+  * SEC "Accessing EDGAR Data" + fair access policy; XBRL companyfacts API docs
+    -- Stages 0-1
+  * HHEM-2.1-Open model card (Vectara) -- what a purpose-built groundedness
+    scorer measures and where it fails. Stage 7
+    https://huggingface.co/vectara/hallucination_evaluation_model
+  * Zheng et al. (2023), "Judging LLM-as-a-Judge with MT-Bench and Chatbot
+    Arena" -- the source for position/verbosity/self-preference bias. Read
+    before you trust any judge score. Stage 7
+
+
+================================================================================
+8. REPO STRUCTURE
+================================================================================
+
+filing-copilot-mcp/
+|-- CLAUDE.md
+|-- README.md                    # leads with the flagship query
+|-- pyproject.toml               # py3.11, black, ruff, mypy
+|-- .env.example                 # committed; .env git-ignored
+|-- docker-compose.yml           # local OpenSearch
+|-- docs/
+|   |-- architecture.md
+|   |-- demo_script.md
+|   `-- decisions/               # one ADR per register entry
+|-- src/filing_copilot/
+|   |-- config.py                # single settings source
+|   |-- edgar/                   # client.py (throttled), companyfacts.py,
+|   |                            # filings.py
+|   |-- structured/
+|   |   |-- backend.py           # SqlBackend protocol -- keep narrow
+|   |   |-- duckdb_backend.py
+|   |   |-- athena_backend.py
+|   |   |-- concepts.yaml        # business concept -> candidate tags
+|   |   |-- periods.py           # fiscal normalization
+|   |   `-- restatement.py
+|   |-- text/                    # sectioner.py, chunkers.py, models.py
+|   |-- embed/                   # encoder.py, cache.py, sagemaker_entry.py
+|   |-- index/                   # backend.py, local_opensearch.py, aoss.py,
+|   |                            # build.py
+|   |-- retrieval/
+|   |   |-- search.py            # vector | bm25 | hybrid(RRF)
+|   |   |-- strategies.py        # fan_out_peers, section_targeted
+|   |   `-- diff.py              # change detection
+|   |-- mcp/
+|   |   |-- server.py
+|   |   `-- tools/               # resolve.py, financials.py, search.py
+|   |-- grounding/               # citations.py, validator.py
+|   `-- cli.py
+|-- evals/
+|   |-- questions.yaml
+|   |-- gold_chunks.yaml
+|   |-- fixtures/                # Parquet + float16 embeddings
+|   |-- tier_a_retrieval.py
+|   |-- tier_b_router.py
+|   `-- tier_c_judge.py
+|-- infra/                       # deploy_aoss.py (asserts NextGen),
+|                                # teardown.py, glue_tables.sql
+`-- tests/
+    `-- test_backend_conformance.py   # runs against DuckDB and Athena
+
+
+CLAUDE.md OUTLINE
+--------------------------------------------------------------------------------
+# filing-copilot-mcp
+
+## What this is
+Research assistant over SEC EDGAR. Exact figures from XBRL via SQL;
+narrative from hybrid retrieval. Portfolio project for senior DS/MLE
+interviews in financial services. Clarity counts as much as correctness.
+
+## Inviolable constraints
+- The LLM never does arithmetic on retrieved text. Figures come from
+  query_financials or they do not appear.
+- Every answer cites filing + section, enforced by grounding/validator.py,
+  not requested in a prompt.
+- Hybrid retrieval (BM25 + vector) is not optional.
+- No hardcoded credentials, bucket names, or regions. config.py only.
+- EDGAR: declared User-Agent, <=10 req/sec, cache everything.
+
+## Architecture (decided -- do not substitute)
+Athena over S3 XBRL | OpenSearch Serverless NextGen (never Classic --
+Classic has a $175-350/mo idle floor) | nomic-embed-text-v1.5 via SageMaker
+Processing | three MCP tools: resolve_entity, query_financials, search_filings
+
+## Scope
+IN: 10-K, 10-Q. Stage 9: 8-K items 4.01/4.02/5.02.
+OUT: DEF 14A -- deliberate, see docs/decisions/. Do not add without asking.
+Corpus: ~20 companies x 3 years, designed to scale by config.
+
+## Local-first
+Stages 1-7 run on DuckDB + Docker OpenSearch. AWS is Stage 8, behind
+unchanged interfaces. CI never hits live AWS.
+
+## Conventions
+Python 3.11+, type hints throughout. black + ruff. Explicit over clever.
+Git commit at the end of each stage.
+
+## Known traps
+- nomic requires task prefixes (search_document: / search_query:) -- silent
+  failure if omitted
+- "Total debt" is not an XBRL tag. See structured/concepts.yaml
+- Global top-k gives concentration, not coverage. Peer questions use
+  retrieval/strategies.py:fan_out_peers
+- Change detection does not use the search index. It is set alignment.
+
+
+================================================================================
+9. VERIFICATION
+================================================================================
+Each stage has a DONE WHEN above; those are the gates.
+End-to-end verification, once Stage 7 lands:
+
+  1. `docker compose up` -> `fc ingest --config configs/demo.yaml` ->
+     `fc build-index` rebuilds from manifest with zero re-embedding on second
+     run
+  2. `pytest evals/tier_a_retrieval.py` reports recall@10, MRR, nDCG@10 against
+     committed gold labels
+  3. `pytest evals/tier_b_router.py` confirms tool sequences, including that no
+     quantitative question is answered without query_financials
+  4. `pytest tests/test_backend_conformance.py` passes identically on DuckDB and
+     (post-Stage 8) Athena
+  5. Deliberately break RRF fusion -> CI turns red
+  6. Run all 8 demo queries end to end; every numeric claim traces to an
+     accession + tag + period; every quoted span validates verbatim against its
+     cited chunk
+
+
+================================================================================
+10. COST MODEL -- $10 HARD BUDGET
+================================================================================
+
+VERIFIED RATES
+  OpenSearch Serverless   $0.24 / OCU-hour
+  AOSS hot storage        $0.02 / GB-month   (no NextGen minimum)
+  Athena                  $5 / TB scanned
+  Claude Opus 5           $5 in / $25 out per MTok
+  Claude Sonnet 5         $2 in / $10 out per MTok
+  Claude Haiku 4.5        $1 in / $5 out per MTok
+  Prompt caching          reads 0.1x, writes 1.25x
+  Batch API               50% off
+
+
+BUDGET
+--------------------------------------------------------------------------------
+  ITEM                                                            COST
+  ------------------------------------------------------------------------
+  OpenSearch NextGen -- ~5 active hrs (local Docker for all dev)   $1.20
+  AOSS indexing -- 2 full rebuilds                                 $0.25
+  Athena -- ~2k dev queries                                        $0.25
+  S3 -- 2GB x 3 months                                             $0.06
+  SageMaker Processing -- ONE run to prove it works                $0.60
+  Haiku router sampling (B2), batched                              $0.30
+  Agent dev + demos VIA CLAUDE CODE MCP CLIENT                     $0
+  Embeddings -- local on the Mac                                   $0
+  HHEM groundedness scoring -- 600MB, CPU                          $0
+  qwen2.5:14b correctness judge -- local Ollama                    $0
+  CI -- public repo / Actions free tier                            $0
+  ------------------------------------------------------------------------
+  TOTAL                                                            ~$2.70
+  ONGOING ONCE SHIPPED                          ~$0.03/month (storage only)
+
+  ~$7 of headroom remains for mistakes. You will need some of it.
+
+
+THE LEVER THAT MAKES THIS WORK
+--------------------------------------------------------------------------------
+  A naive build of this plan costs $195-285, almost all of it LLM API spend on
+  agent iteration, demos, and LLM-judge evals. Driving the MCP server from
+  CLAUDE CODE -- which is already an MCP client, on a subscription already paid
+  for -- takes that to zero at the margin. The eval redesign in section 4
+  removes the rest.
+
+  The eval redesign in section 4 removes the rest: groundedness runs on a 600MB
+  open-weights cross-encoder, correctness on a local Ollama model -- both
+  genuinely free rather than subscription-subsidized.
+
+  LOCAL MODELS ARE FREE IN DOLLARS, NOT IN TIME. A 70-question judge run costs
+  ~45 minutes of wall clock on a 16GB M1 Pro, and blocks the machine while it
+  runs. That is the real price, and it is why the judge is nightly and
+  non-blocking rather than per-PR.
+
+  HONEST CAVEAT: "free" here means ALREADY PAID FOR. Anything that must run
+  headless still needs API credits, which is exactly why CI was redesigned to
+  make zero API calls.
+
+
+DO NOT CUT THE CORPUS
+--------------------------------------------------------------------------------
+  The intuitive economy is dropping 20 companies to 8. IT SAVES ABOUT FOUR
+  CENTS. Embeddings run locally, storage is $0.02/GB, indexing time barely
+  moves. It would gut peer benchmarking -- your most interview-relevant
+  archetype -- and hide the retrieval-concentration bug you need to discover.
+  Corpus size is not a cost driver. Keep all 20.
+
+
+WHAT ACTUALLY BLOWS THE BUDGET
+--------------------------------------------------------------------------------
+  1. A CLASSIC COLLECTION. $175-350/month -- 17-35x the entire budget, in month
+     one. See Stage 8 guardrails.
+  2. A FORGOTTEN PROVISIONED OPENSEARCH DOMAIN. Same damage. Run teardown
+     anyway.
+  3. EXHAUSTING CLAUDE CODE USAGE LIMITS DURING STAGE 5 and falling back to API
+     keys. If that happens, PAUSE AGENT ITERATION and go work on retrieval
+     (Tier A, free) rather than paying per-token to keep going.
+  4. RETRIEVAL k. If you ever do run API-driven evals, input tokens are ~80% of
+     the bill and are mostly retrieved chunks -- k=20 roughly doubles cost vs
+     k=10. Decide k on Tier A recall, but know it is also the cost dial.
+
+
+================================================================================
+11. OPEN ITEMS FOR YOU TO PUSH BACK ON
+================================================================================
+
+  1. CORPUS COMPOSITION. I've assumed card issuers + consumer lenders
+     (COF, SYF, AXP, DFS, BFH) plus peers/contrast filers. Stage 1 needs the
+     actual 20-name list, INCLUDING AT LEAST ONE NON-DECEMBER FYE FILER to make
+     demo query 2 work.
+
+  2. TOTAL EFFORT IS 114-152 HOURS -- ~9-13 weeks at your stated pace. That is
+     the honest number for building this properly while learning retrieval from
+     scratch. If it's too long, take the cut line in section 2 rather than
+     thinning every stage.
+
+  3. STAGE 2 IS THE ESTIMATE I LEAST TRUST. Its day-one probe exists precisely
+     so you find out in hour two rather than week three.
+
+================================================================================
+END OF PLAN
+================================================================================

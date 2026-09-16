@@ -1,0 +1,27 @@
+# Secrets — MUST stay first. This repo is public.
+.env
+.env.*
+!.env.example
+
+# Data — large, regenerable from SEC. Never commit.
+data/
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Tool caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,54 @@
+[project]
+name = "filing-copilot-mcp"
+version = "0.1.0"
+description = "Research assistant over SEC EDGAR filings: exact figures from XBRL via SQL, narrative from hybrid retrieval, grounded in enforced citations."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.27",
+    "pydantic>=2.7",
+    "pydantic-settings>=2.3",
+    "typer>=0.12",
+]
+
+[project.scripts]
+fc = "filing_copilot.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "mypy>=1.10",
+    "ruff>=0.5",
+    "black>=24.4",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/filing_copilot"]
+
+[tool.black]
+line-length = 100
+target-version = ["py312"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "PTH", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "network: test hits live SEC EDGAR (deselected by default; run with -m network)",
+]
+addopts = "-m 'not network'"
