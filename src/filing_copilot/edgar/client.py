@@ -15,7 +15,8 @@ from __future__ import annotations
 
 import random
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from pathlib import Path
 from types import TracebackType
 
 import httpx
@@ -94,6 +95,67 @@ class EdgarClient:
         )
         return body
 
+    def download(
+        self,
+        url: str,
+        *,
+        refresh: bool = False,
+        on_progress: Callable[[int], None] | None = None,
+    ) -> Path:
+        """Stream a large response into the cache and return the file's path.
+
+        Use this instead of :meth:`get` when the body is too big to hold in
+        memory -- ``companyfacts.zip`` is ~1.2GB. The body is never returned as
+        bytes; callers open the cached file, which for a zip means reading
+        members in place rather than expanding it.
+
+        ``on_progress`` receives the cumulative byte count as it is written.
+        """
+        path = self._cache.path_for(url)
+        if not refresh and path.is_file():
+            return path
+        return self._stream_with_retries(url, on_progress)
+
+    def _stream_with_retries(self, url: str, on_progress: Callable[[int], None] | None) -> Path:
+        last_error: str = ""
+        for attempt in range(self._settings.edgar_max_retries + 1):
+            # Inside the loop for the same reason as _fetch_with_retries: a retry
+            # is a request and must consume rate budget.
+            self._limiter.acquire()
+            self.request_count += 1
+            retry_after: str | None = None
+
+            try:
+                with self._client.stream("GET", url) as response:
+                    if response.status_code < 400:
+                        chunks = response.iter_bytes()
+                        if on_progress is not None:
+                            chunks = _report_progress(chunks, on_progress)
+                        return self._cache.put_stream(
+                            url,
+                            chunks,
+                            status=response.status_code,
+                            content_type=response.headers.get("content-type"),
+                            etag=response.headers.get("etag"),
+                        )
+
+                    response.read()  # the error body is small; read it for the reason
+                    if response.status_code not in RETRYABLE_STATUSES:
+                        raise EdgarHTTPError(url, response.status_code, response.reason_phrase)
+                    if attempt >= self._settings.edgar_max_retries:
+                        raise EdgarHTTPError(url, response.status_code, response.reason_phrase)
+                    last_error = response.reason_phrase
+                    retry_after = response.headers.get("retry-after")
+            except httpx.TransportError as exc:
+                # A mid-stream failure already discarded its .partial file.
+                last_error = str(exc)
+                if attempt >= self._settings.edgar_max_retries:
+                    raise EdgarHTTPError(url, 0, last_error) from exc
+
+            self._sleep(self._backoff(attempt, retry_after))
+
+        raise EdgarHTTPError(url, 0, last_error)  # pragma: no cover - loop always returns
+
     def _fetch_with_retries(self, url: str) -> httpx.Response:
         last_error: str = ""
         for attempt in range(self._settings.edgar_max_retries + 1):
@@ -149,3 +211,14 @@ class EdgarClient:
         tb: TracebackType | None,
     ) -> None:
         self.close()
+
+
+def _report_progress(
+    chunks: Iterator[bytes], on_progress: Callable[[int], None]
+) -> Iterator[bytes]:
+    """Yield chunks unchanged, reporting cumulative bytes written."""
+    total = 0
+    for chunk in chunks:
+        total += len(chunk)
+        on_progress(total)
+        yield chunk

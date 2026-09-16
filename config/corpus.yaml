@@ -1,0 +1,130 @@
+# The companies this project ingests. Corpus growth is a config change, not a
+# code change -- add a row here and re-run ingestion.
+#
+# cik is the canonical 10-digit zero-padded form (see edgar/identifiers.py) and
+# is quoted so YAML does not strip the leading zeros into an int. It is the join
+# key everywhere downstream: tickers change hands, CIKs do not.
+#
+# `lender` drives the coverage-matrix thresholds. A card network or a technology
+# company does not report an allowance for credit losses, and reporting that as
+# a clean absence is correct behaviour, not a gap -- see docs/decisions/.
+#
+# Fiscal year ends are NOT recorded here. They are derived from the filed data
+# during ingestion, because an assumption about a fiscal calendar that silently
+# disagrees with the filings is exactly the bug this stage exists to prevent.
+
+companies:
+  # --- Card issuers and consumer lenders ------------------------------------
+  # The domain the project targets. Dense credit disclosure, comparable peers.
+  - ticker: COF
+    cik: "0000927628"
+    name: Capital One Financial Corp
+    group: card_issuer
+    lender: true
+  - ticker: SYF
+    cik: "0001601712"
+    name: Synchrony Financial
+    group: card_issuer
+    lender: true
+  - ticker: AXP
+    cik: "0000004962"
+    name: American Express Co
+    group: card_issuer
+    lender: true
+  - ticker: BFH
+    cik: "0001101215"
+    name: Bread Financial Holdings, Inc.
+    group: card_issuer
+    lender: true
+  - ticker: ALLY
+    cik: "0000040729"
+    name: Ally Financial Inc.
+    group: consumer_lender
+    lender: true
+  - ticker: SOFI
+    cik: "0001818874"
+    name: SoFi Technologies, Inc.
+    group: consumer_lender
+    lender: true
+
+  # --- Money-center banks ---------------------------------------------------
+  # Large, densely tagged filers. Useful as a well-behaved baseline when a
+  # concept fails to resolve for a smaller issuer.
+  - ticker: JPM
+    cik: "0000019617"
+    name: JPMorgan Chase & Co
+    group: money_center_bank
+    lender: true
+  - ticker: BAC
+    cik: "0000070858"
+    name: Bank of America Corp
+    group: money_center_bank
+    lender: true
+  - ticker: C
+    cik: "0000831001"
+    name: Citigroup Inc
+    group: money_center_bank
+    lender: true
+  - ticker: WFC
+    cik: "0000072971"
+    name: Wells Fargo & Company
+    group: money_center_bank
+    lender: true
+
+  # --- Regional banks -------------------------------------------------------
+  # The peer set most likely to expose real us-gaap tag variation, which is what
+  # the concept-mapping layer exists to absorb.
+  - ticker: USB
+    cik: "0000036104"
+    name: U.S. Bancorp
+    group: regional_bank
+    lender: true
+  - ticker: PNC
+    cik: "0000713676"
+    name: PNC Financial Services Group, Inc.
+    group: regional_bank
+    lender: true
+  - ticker: TFC
+    cik: "0000092230"
+    name: Truist Financial Corp
+    group: regional_bank
+    lender: true
+  - ticker: RF
+    cik: "0001281761"
+    name: Regions Financial Corp
+    group: regional_bank
+    lender: true
+  - ticker: FITB
+    cik: "0000035527"
+    name: Fifth Third Bancorp
+    group: regional_bank
+    lender: true
+  - ticker: CFG
+    cik: "0000759944"
+    name: Citizens Financial Group Inc
+    group: regional_bank
+    lender: true
+
+  # --- Networks and deliberate contrast filers ------------------------------
+  # Non-lenders, included on purpose. They exercise the resolver's unhappy path
+  # and supply the non-December fiscal year ends the alignment warning needs.
+  - ticker: V
+    cik: "0001403161"
+    name: Visa Inc.
+    group: card_network
+    lender: false
+  - ticker: MA
+    cik: "0001141391"
+    name: Mastercard Inc
+    group: card_network
+    lender: false
+  - ticker: JEF
+    cik: "0000096223"
+    name: Jefferies Financial Group Inc.
+    group: investment_bank
+    lender: true
+  - ticker: AAPL
+    cik: "0000320193"
+    name: Apple Inc.
+    group: non_financial_contrast
+    lender: false

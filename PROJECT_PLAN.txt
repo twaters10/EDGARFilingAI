@@ -256,10 +256,16 @@ KEY DECISIONS
     comparison
 
 DONE WHEN
-  The coverage matrix shows total_debt, total_revenue, and
-  allowance_for_credit_losses resolving for >=18 of 20 companies; a query mixing
-  a December-FYE and a September-FYE filer returns a visible alignment warning;
-  a restated period returns both bases on request.
+  The coverage matrix meets its PER-CONCEPT thresholds (amended -- see ADR-0018):
+  total_revenue and total_debt resolve for >=18 of 20 companies;
+  allowance_for_credit_losses resolves for >=14 of the 17 LENDERS, with
+  non-lenders reported as a clean absence rather than counted as misses. The
+  original flat >=18/20 for allowance_for_credit_losses was unreachable for any
+  corpus containing a card network or a non-financial contrast filer, and the
+  only way to pass it was to pack the corpus with 20 identical lenders.
+
+  Also: a query mixing a December-FYE and a September-FYE filer returns a
+  visible alignment warning; a restated period returns both bases on request.
 
   >> DO NOT SKIP THE COVERAGE MATRIX. It is the cheapest early probe for the
      highest-likelihood data risk in the project.

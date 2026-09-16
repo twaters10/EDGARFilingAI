@@ -25,3 +25,5 @@ choice was *made* rather than defaulted into.
 | [0015](ADR-0015-rate-limit-of-5-requests-per-second.md) | Rate limit of 5 req/s | 0 |
 | [0016](ADR-0016-bulk-endpoints-over-per-company-api-calls.md) | Bulk endpoints; never extract companyfacts.zip | 0–1 |
 | [0017](ADR-0017-cache-entries-never-expire.md) | Cache entries never expire | 0 |
+| [0018](ADR-0018-concept-mapping-layer.md) | Declarative concept-mapping layer | 1 |
+| [0019](ADR-0019-annual-period-selection.md) | Annual period selection: span window + derived FYE | 1 |

@@ -1,0 +1,102 @@
+# Business concept -> ordered candidate us-gaap tags.
+#
+# "TOTAL DEBT" IS NOT AN XBRL TAG. Companies report the same business idea under
+# different concepts, and a question like "how much did debt increase?" breaks on
+# exactly that. This file is the declarative layer that absorbs the variation.
+#
+# Every candidate list here was derived from the ingested corpus, not guessed.
+# Ordering is meaningful: `first_available` takes the first candidate a company
+# actually reports, and the resolver records WHICH tag answered so two companies
+# answered from different tags are never silently compared as like for like.
+#
+# Candidate lists are explicit allow-lists, never patterns. A substring match on
+# "Debt" pulls in AvailableForSaleDebtSecurities* -- investment ASSETS, not money
+# owed. Pattern matching here would report a bank's bond portfolio as its debt.
+#
+# `applies_to` scopes the coverage threshold. A concept that only lenders report
+# must be measured against lenders; counting a card network as a miss measures
+# nothing and pressures the corpus toward 20 identical companies.
+#
+# `unit` and `period_type` are part of the concept, not optional filters. Units in
+# this data are free-form (USD, shares, pure, business, putative_class_actio), and
+# an instant (balance-sheet) fact is not comparable to a duration (income) fact.
+
+concepts:
+  total_revenue:
+    label: Total revenue
+    rule: first_available
+    applies_to: all
+    unit: USD
+    period_type: duration
+    description: >
+      Total revenue for the period. For banks and card issuers the meaningful
+      figure is net of interest expense, so that tag is preferred where reported.
+    candidates:
+      - RevenuesNetOfInterestExpense
+      - Revenues
+      - RevenueFromContractWithCustomerExcludingAssessedTax
+      # Last resort. This is GROSS interest income, a weaker proxy for "total
+      # revenue" than the tags above. It resolves for banks that report nothing
+      # else, and the resolver surfaces it as the answering tag so the
+      # substitution is visible in the response rather than hidden in it.
+      - InterestAndDividendIncomeOperating
+      # Synchrony reports neither of the tags above; this is its equivalent
+      # gross-interest line. Same caveat as the candidate before it.
+      - InterestIncomeOperating
+
+  total_debt:
+    label: Total debt
+    rule: first_available
+    applies_to: all
+    unit: USD
+    period_type: instant
+    description: >
+      Borrowed money owed at the period end. Deposits are deliberately excluded:
+      a deposit is a customer liability, not borrowing, and folding it in makes
+      every depository look catastrophically levered next to a card network.
+    candidates:
+      - LongTermDebt
+      - LongTermDebtNoncurrent
+      - DebtLongtermAndShorttermCombinedAmount
+      - LongTermDebtAndCapitalLeaseObligations
+      - UnsecuredDebt
+
+  allowance_for_credit_losses:
+    label: Allowance for credit losses
+    rule: first_available
+    applies_to: lenders
+    unit: USD
+    period_type: instant
+    description: >
+      The CECL reserve held against expected credit losses on loans and
+      receivables. Reported only by lenders; a card network or a technology
+      company has no such balance and resolving to empty is correct.
+    candidates:
+      - FinancingReceivableAllowanceForCreditLossExcludingAccruedInterest
+      - FinancingReceivableAllowanceForCreditLosses
+      - AllowanceForDoubtfulAccountsReceivable
+
+  total_assets:
+    label: Total assets
+    rule: first_available
+    applies_to: all
+    unit: USD
+    period_type: instant
+    description: >
+      Included as a control. It resolves for essentially every filer under a
+      single tag, so a coverage matrix in which total_assets is patchy indicates
+      a broken ingest rather than genuine tag heterogeneity.
+    candidates:
+      - Assets
+
+  net_income:
+    label: Net income
+    rule: first_available
+    applies_to: all
+    unit: USD
+    period_type: duration
+    description: Net income attributable to the company for the period.
+    candidates:
+      - NetIncomeLoss
+      - ProfitLoss
+      - NetIncomeLossAvailableToCommonStockholdersBasic

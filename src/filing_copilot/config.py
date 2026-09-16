@@ -48,6 +48,14 @@ class Settings(BaseSettings):
 
     # --- Storage -----------------------------------------------------------
     data_dir: Path = Field(default=Path("data"))
+    corpus_path: Path = Field(
+        default=Path("config/corpus.yaml"),
+        description="The companies to ingest. Corpus growth is a config change.",
+    )
+    concepts_path: Path | None = Field(
+        default=None,
+        description="Override the packaged concepts.yaml. Unset uses the shipped file.",
+    )
 
     # --- AWS (unused until Stage 8; declared so nothing is ever hardcoded) --
     aws_region: str | None = None
@@ -73,8 +81,23 @@ class Settings(BaseSettings):
 
     @property
     def raw_dir(self) -> Path:
-        """Root of the on-disk response cache."""
+        """Root of the on-disk response cache. Exactly as SEC served it."""
         return self.data_dir / "raw"
+
+    @property
+    def interim_dir(self) -> Path:
+        """Scratch space for work in progress. Safe to delete and rebuild."""
+        return self.data_dir / "interim"
+
+    @property
+    def processed_dir(self) -> Path:
+        """Query-ready artifacts -- the Parquet fact tree lives here."""
+        return self.data_dir / "processed"
+
+    @property
+    def facts_dir(self) -> Path:
+        """Root of the partitioned fact table: cik=<cik>/fiscal_year=<yyyy>/."""
+        return self.processed_dir / "facts"
 
 
 @lru_cache(maxsize=1)

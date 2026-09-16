@@ -25,12 +25,15 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlparse
 
 _META_SUFFIX = ".meta.json"
+# An in-flight streamed download. Renamed into place only once complete.
+_PARTIAL_SUFFIX = ".partial"
 
 # Ordered (pattern, replacement) rules mapping a URL path to a cache-relative path.
 # First match wins; anything unmatched falls back to misc/<host>/<path>.
@@ -103,16 +106,85 @@ class ResponseCache:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(body)
 
+        self._write_meta(
+            path,
+            url=url,
+            status=status,
+            content_type=content_type,
+            etag=etag,
+            size=len(body),
+            sha256=hashlib.sha256(body).hexdigest(),
+        )
+        return path
+
+    def _write_meta(
+        self,
+        path: Path,
+        *,
+        url: str,
+        status: int,
+        content_type: str | None,
+        etag: str | None,
+        size: int,
+        sha256: str,
+    ) -> None:
+        """Write the provenance sidecar that makes a cached file traceable."""
         meta = {
             "url": url,
             "fetched_at": datetime.now(UTC).isoformat(),
             "status": status,
             "content_type": content_type,
             "etag": etag,
-            "bytes": len(body),
-            "sha256": hashlib.sha256(body).hexdigest(),
+            "bytes": size,
+            "sha256": sha256,
         }
         self._meta_path(path).write_text(json.dumps(meta, indent=2), encoding="utf-8")
+
+    def put_stream(
+        self,
+        url: str,
+        chunks: Iterable[bytes],
+        *,
+        status: int,
+        content_type: str | None = None,
+        etag: str | None = None,
+    ) -> Path:
+        """Write a response body from an iterator, without holding it in memory.
+
+        ``companyfacts.zip`` is ~1.2GB; :meth:`put` would materialize that twice
+        (once as the argument, once to hash it). This hashes and sizes as it
+        writes instead.
+
+        Writes to a ``.partial`` sibling and renames only on success, so an
+        interrupted download can never be mistaken for a complete cache entry --
+        :meth:`get` trusts the presence of the file alone.
+        """
+        path = self.path_for(url)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        partial = path.with_name(path.name + _PARTIAL_SUFFIX)
+
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with partial.open("wb") as handle:
+                for chunk in chunks:
+                    handle.write(chunk)
+                    digest.update(chunk)
+                    size += len(chunk)
+            partial.replace(path)
+        except BaseException:
+            partial.unlink(missing_ok=True)
+            raise
+
+        self._write_meta(
+            path,
+            url=url,
+            status=status,
+            content_type=content_type,
+            etag=etag,
+            size=size,
+            sha256=digest.hexdigest(),
+        )
         return path
 
     def meta_for(self, url: str) -> dict[str, object] | None:
@@ -132,7 +204,7 @@ class ResponseCache:
             return CacheStats(0, 0, None, None)
 
         for item in self._root.rglob("*"):
-            if not item.is_file() or item.name.endswith(_META_SUFFIX):
+            if not item.is_file() or item.name.endswith((_META_SUFFIX, _PARTIAL_SUFFIX)):
                 continue
             entries += 1
             total += item.stat().st_size
