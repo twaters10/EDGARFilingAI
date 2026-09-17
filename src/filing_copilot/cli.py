@@ -13,6 +13,21 @@ from .config import ConfigError, Settings, get_settings
 from .edgar import EdgarClient, TickerResolver, UnknownTickerError, normalize_cik
 from .edgar.endpoints import company_tickers_url, companyfacts_bulk_url, submissions_url
 from .edgar.identifiers import Company, InvalidCIKError
+from .filings import (
+    CHUNKERS,
+    TARGET_ITEMS,
+    CoverageReport,
+    FilingCoverage,
+    FilingDocument,
+    FilingText,
+    build_report,
+    download_corpus,
+    find_sections,
+    normalize,
+    verify_offsets,
+)
+from .filings.download import MAX_HISTORY_PAGES, CompanyDownload, download_company
+from .filings.index import IncompleteFilingIndexError
 from .structured import (
     AS_REPORTED,
     AS_RESTATED,
@@ -399,3 +414,307 @@ def _print_financials(result: FinancialsResult) -> None:
     for warning in result.warnings:
         typer.echo("")
         typer.secho(f"  {warning}", fg=typer.colors.YELLOW)
+
+
+# --- Stage 2: filing text ------------------------------------------------
+
+
+@app.command("fetch-filings")
+def fetch_filings(
+    years: Annotated[int, typer.Option("--years", help="Annual filings per company.")] = 3,
+    max_pages: Annotated[
+        int, typer.Option("--max-pages", help="History pages to walk back per company.")
+    ] = MAX_HISTORY_PAGES,
+    refresh: RefreshOpt = False,
+) -> None:
+    """Download the corpus's 10-K primary documents.
+
+    Index completeness is asserted per company *before* any document is
+    fetched. A short corpus that downloads cleanly is the failure mode this
+    guards against -- the gap would otherwise surface as a thin answer several
+    stages later, far from its cause.
+    """
+    settings = _load_settings()
+
+    try:
+        corpus = Corpus.load(settings.corpus_path)
+    except CorpusError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+
+    typer.echo(f"{'ticker':<8} {'filings':>7} {'fetched':>7} {'MiB':>7}  years")
+    typer.echo("-" * 52)
+
+    def report_company(result: CompanyDownload) -> None:
+        years_seen = sorted({d.ref.fiscal_year for d in result.documents})
+        span = f"{years_seen[0]}-{years_seen[-1]}" if years_seen else "--"
+        size = sum(d.size_bytes for d in result.documents) / 1_048_576
+        typer.echo(
+            f"{result.ticker:<8} {len(result.documents):>7} {result.fetched:>7} "
+            f"{size:>7,.1f}  {span}"
+        )
+
+    with EdgarClient(settings) as client:
+        try:
+            report = download_corpus(
+                client,
+                corpus,
+                years=years,
+                refresh=refresh,
+                max_pages=max_pages,
+                on_company=report_company,
+            )
+        except IncompleteFilingIndexError as exc:
+            typer.secho(f"\n{exc}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from exc
+
+        typer.echo("-" * 52)
+        typer.echo(
+            f"{'total':<8} {len(report.documents):>7} "
+            f"{'':>7} {report.total_bytes / 1_048_576:>7,.1f}"
+        )
+        typer.echo(f"requests: {client.request_count}")
+
+    if report.failures:
+        typer.echo("")
+        for failure in report.failures:
+            typer.secho(f"  FAILED  {failure}", fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1)
+
+
+@app.command("sections")
+def sections(
+    years: Annotated[int, typer.Option("--years", help="Annual filings per company.")] = 3,
+    threshold: Annotated[
+        float, typer.Option("--threshold", help="Required share with all core items.")
+    ] = 0.90,
+    chunker: Annotated[
+        str, typer.Option("--chunker", help="Chunker to size: item_aware or fixed_window.")
+    ] = "item_aware",
+) -> None:
+    """Parser coverage report over the downloaded filings.
+
+    Reads only from the cache and makes no network requests when warm. Every
+    shortfall is listed by name -- the point of this report is the failures,
+    not the percentage.
+    """
+    settings = _load_settings()
+
+    if chunker not in CHUNKERS:
+        typer.secho(
+            f"--chunker must be one of {', '.join(sorted(CHUNKERS))}, got {chunker!r}.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    try:
+        corpus = Corpus.load(settings.corpus_path)
+    except CorpusError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+
+    docs: list[FilingText] = []
+    with EdgarClient(settings) as client:
+        try:
+            downloaded = download_corpus(client, corpus, years=years)
+        except IncompleteFilingIndexError as exc:
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from exc
+
+        if client.request_count:
+            typer.secho(
+                f"note: {client.request_count} request(s) -- the cache was cold.",
+                fg=typer.colors.YELLOW,
+            )
+
+    for company in downloaded.companies:
+        entry = corpus.by_ticker(company.ticker)
+        for document in company.documents:
+            text = normalize(document.path.read_bytes())
+            docs.append(
+                FilingText(
+                    ref=document.ref,
+                    ticker=company.ticker,
+                    company_name=entry.name,
+                    text=text,
+                    sections=find_sections(text),
+                )
+            )
+
+    if not docs:
+        typer.secho(
+            "No filings on disk. Run 'fc fetch-filings' first.", fg=typer.colors.RED, err=True
+        )
+        raise typer.Exit(code=2)
+
+    typer.echo(f"{'ticker':<8}{'FY':<6}{'chars':>9}  {'strategy':<15}{'state':<9}items")
+    typer.echo("-" * 72)
+
+    def report_filing(filing: FilingCoverage) -> None:
+        colour = {"located": None, "partial": typer.colors.YELLOW, "failed": typer.colors.RED}
+        typer.secho(
+            f"{filing.ticker:<8}{filing.fiscal_year:<6}{filing.total_chars:>9,}  "
+            f"{filing.strategy:<15}{filing.state:<9}{','.join(filing.found) or '--'}",
+            fg=colour[filing.state],
+        )
+
+    report = build_report(docs, on_filing=report_filing)
+    _print_coverage_summary(report, docs, threshold, chunker)
+
+    if not report.meets(threshold):
+        raise typer.Exit(code=1)
+
+
+def _print_coverage_summary(
+    report: CoverageReport, docs: list[FilingText], threshold: float, chunker: str
+) -> None:
+    typer.echo("-" * 72)
+    counts = "  ".join(f"{name}={n}" for name, n in sorted(report.by_strategy.items()))
+    typer.echo(
+        f"core items {', '.join(('1A', '7', '9A'))} located in "
+        f"{len(report.located)}/{len(report.filings)} ({report.rate:.0%})   {counts}"
+    )
+
+    for filing in report.shortfalls:
+        typer.secho(
+            f"\n  {filing.state.upper():<8} {filing.ticker} FY{filing.fiscal_year} "
+            f"({filing.document})",
+            fg=typer.colors.YELLOW if filing.state == "partial" else typer.colors.RED,
+        )
+        typer.echo(f"    {filing.reason}")
+        if filing.missing:
+            typer.echo(f"    not located: {', '.join(filing.missing)}")
+        if filing.implausible:
+            typer.echo(f"    too short to be real: {', '.join(filing.implausible)}")
+        if filing.incorporated:
+            typer.echo(f"    incorporated by reference: {', '.join(filing.incorporated)}")
+
+    problems = [p for doc in docs for p in verify_offsets(doc)]
+    typer.echo("")
+    if problems:
+        for problem in problems:
+            typer.secho(f"  OFFSETS  {problem}", fg=typer.colors.RED, err=True)
+    else:
+        typer.echo(f"offsets round-trip: OK across {len(docs)} filings")
+
+    split = CHUNKERS[chunker]
+    chunks = [c for doc in docs for c in split(doc)]
+    if chunks:
+        tokens = sorted(c.tokens for c in chunks)
+        typer.echo(
+            f"{chunker}: {len(chunks):,} chunks  "
+            f"median {tokens[len(tokens) // 2]} tokens  "
+            f"p95 {tokens[int(len(tokens) * 0.95)]} tokens"
+        )
+
+    if not report.meets(threshold):
+        typer.secho(
+            f"\nBelow the {threshold:.0%} threshold. Every shortfall is listed above.",
+            fg=typer.colors.RED,
+        )
+
+
+@app.command("show")
+def show(
+    ticker: Annotated[str, typer.Option("--ticker", "-t", help="Corpus ticker, e.g. COF.")],
+    item: Annotated[str, typer.Option("--item", "-i", help="Item number, e.g. 1A.")] = "1A",
+    fy: Annotated[
+        int | None, typer.Option("--fy", help="Fiscal year. Defaults to the most recent.")
+    ] = None,
+    chars: Annotated[int, typer.Option("--chars", help="Characters shown at each end.")] = 800,
+    full: Annotated[bool, typer.Option("--full", help="Print the whole section.")] = False,
+    offsets: Annotated[bool, typer.Option("--offsets", help="Print offsets only.")] = False,
+) -> None:
+    """Print a located section's text, with the offsets it came from.
+
+    The inspection tool for everything Stage 2 asserts. 'Located' only means a
+    span of plausible length was found -- whether it holds the right content is
+    a question only reading it can answer.
+    """
+    settings = _load_settings()
+    item = item.strip().upper()
+
+    try:
+        corpus = Corpus.load(settings.corpus_path)
+        company = corpus.by_ticker(ticker)
+    except CorpusError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+
+    with EdgarClient(settings) as client:
+        try:
+            downloaded = download_company(client, company, years=_SHOW_YEARS)
+        except IncompleteFilingIndexError as exc:
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from exc
+
+    document = _pick_filing(downloaded.documents, company.ticker, fy)
+    text = normalize(document.path.read_bytes())
+    sections = find_sections(text)
+
+    located = sections.get(item)
+    if located is None:
+        found = ", ".join(i for i in TARGET_ITEMS if i in sections) or "none"
+        typer.secho(
+            f"{company.ticker} FY{document.ref.fiscal_year}: Item {item} was not located.\n"
+            f"Located: {found}.\nRun 'fc sections' for why it was missed.",
+            fg=typer.colors.YELLOW,
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    typer.echo(
+        f"{company.ticker} FY{document.ref.fiscal_year} · {document.ref.form} · "
+        f"Item {item} · {located.strategy}"
+    )
+    typer.echo(
+        f"chars {located.char_start:,}-{located.char_end:,} "
+        f"({located.length:,} long) of {len(text):,} · {document.ref.accession}"
+    )
+    for extra_start, extra_end in located.extra_spans:
+        # Only a crossref section has these, and they are the least obvious thing
+        # about its output -- a filer declaring "8 - 24, 80 - 85" gets two blocks.
+        typer.echo(f"  also declared: chars {extra_start:,}-{extra_end:,}")
+
+    if offsets:
+        return
+
+    body = text[located.char_start : located.char_end]
+    typer.echo("-" * 72)
+    if full or len(body) <= chars * 2:
+        typer.echo(body)
+        return
+    typer.echo(body[:chars])
+    typer.secho(f"\n[... {len(body) - chars * 2:,} characters elided ...]\n", dim=True)
+    typer.echo(body[-chars:])
+
+
+# Enough years that --fy can select a back year; a warm cache makes this free.
+_SHOW_YEARS = 3
+
+
+def _pick_filing(documents: list[FilingDocument], ticker: str, fy: int | None) -> FilingDocument:
+    """The requested fiscal year, or the most recent filing on disk."""
+    if not documents:
+        typer.secho(
+            f"No cached filings for {ticker}. Run 'fc fetch-filings' first.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    if fy is None:
+        return max(documents, key=lambda d: d.ref.fiscal_year)
+
+    for document in documents:
+        if document.ref.fiscal_year == fy:
+            return document
+
+    years = ", ".join(
+        str(d.ref.fiscal_year) for d in sorted(documents, key=lambda d: -d.ref.fiscal_year)
+    )
+    typer.secho(
+        f"{ticker} has no FY{fy} filing on disk. Available: {years}.", fg=typer.colors.RED, err=True
+    )
+    raise typer.Exit(code=2)

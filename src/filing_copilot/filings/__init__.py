@@ -1,0 +1,81 @@
+"""Filing text: acquisition, sectioning, chunking."""
+
+from .chunkers import (
+    CHUNKERS,
+    OVERLAP_FRACTION,
+    TARGET_TOKENS,
+    Chunk,
+    FilingText,
+    contextual_prefix,
+    fixed_window,
+    item_aware,
+    item_label,
+)
+from .coverage import CORE_ITEMS, CoverageReport, FilingCoverage, build_report, verify_offsets
+from .crossref import find_sections_by_page, page_index, parse_page_references
+from .download import (
+    CompanyDownload,
+    DownloadReport,
+    FilingDocument,
+    download_company,
+    download_corpus,
+)
+from .index import (
+    FilingRef,
+    IncompleteFilingIndexError,
+    assert_complete,
+    coverage_window,
+    has_older_pages,
+    parse_recent,
+    select_annual_filings,
+)
+from .normalize import is_data_table, normalize, table_placeholder
+from .sections import (
+    CROSSREF,
+    ITEM_HEADING,
+    TARGET_ITEMS,
+    Section,
+    find_sections,
+    find_sections_by_heading,
+)
+
+__all__ = [
+    "CHUNKERS",
+    "CORE_ITEMS",
+    "CROSSREF",
+    "ITEM_HEADING",
+    "OVERLAP_FRACTION",
+    "TARGET_ITEMS",
+    "TARGET_TOKENS",
+    "Chunk",
+    "CompanyDownload",
+    "CoverageReport",
+    "DownloadReport",
+    "FilingCoverage",
+    "FilingDocument",
+    "FilingRef",
+    "FilingText",
+    "IncompleteFilingIndexError",
+    "Section",
+    "assert_complete",
+    "build_report",
+    "contextual_prefix",
+    "coverage_window",
+    "download_company",
+    "download_corpus",
+    "find_sections",
+    "find_sections_by_heading",
+    "find_sections_by_page",
+    "fixed_window",
+    "has_older_pages",
+    "is_data_table",
+    "item_aware",
+    "item_label",
+    "normalize",
+    "page_index",
+    "parse_page_references",
+    "parse_recent",
+    "select_annual_filings",
+    "table_placeholder",
+    "verify_offsets",
+]

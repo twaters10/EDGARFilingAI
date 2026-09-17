@@ -1,0 +1,135 @@
+ticker  FY        chars  strategy       state    items
+------------------------------------------------------------------------
+COF     2025    920,339  item_heading   located  1,1A,7,7A,9A
+COF     2024    821,331  item_heading   located  1,1A,7,7A,9A
+COF     2023    786,990  item_heading   located  1,1A,7,7A,9A
+SYF     2025    558,615  crossref_pages located  1,1A,3,7,7A,8,9A
+SYF     2024    566,166  crossref_pages located  1,1A,7,7A,8,9A
+SYF     2023    546,815  crossref_pages partial  1,1A,7,7A
+AXP     2025    606,624  item_heading   located  1,1A,7,8,9A
+AXP     2024    602,035  item_heading   located  1,1A,7,8,9A
+AXP     2023    584,492  item_heading   located  1,1A,7,8,9A
+BFH     2025    555,011  item_heading   located  1,1A,7,9A
+BFH     2024    558,954  item_heading   located  1,1A,7,9A
+BFH     2023    509,554  item_heading   located  1,1A,7,9A
+ALLY    2025    951,881  item_heading   located  1,1A,7,8,9A
+ALLY    2024    992,346  item_heading   located  1,1A,7,8,9A
+ALLY    2023    971,922  item_heading   located  1,1A,7,8,9A
+SOFI    2025  1,060,846  item_heading   located  1,1A,7,7A,8,9A
+SOFI    2024  1,029,887  item_heading   located  1,1A,7,7A,8,9A
+SOFI    2023    980,854  item_heading   located  1,1A,7,7A,8,9A
+JPM     2025  1,190,990  item_heading   partial  1,1A,9A
+JPM     2024  1,223,229  item_heading   partial  1,1A,9A
+JPM     2023  1,246,997  item_heading   partial  1,1A,9A
+BAC     2025    979,106  item_heading   located  1,1A,7,8,9A
+BAC     2024    981,912  item_heading   located  1,1A,7,8,9A
+BAC     2023    995,847  item_heading   located  1,1A,7,8,9A
+C       2025  1,253,713  none           failed   --
+C       2024  1,342,089  none           failed   --
+C       2023  1,340,921  none           failed   --
+WFC     2025     88,433  item_heading   partial  1
+WFC     2024    319,255  item_heading   partial  1
+WFC     2023    368,719  item_heading   partial  1
+USB     2025    254,446  item_heading   partial  1
+USB     2024    245,085  item_heading   partial  1
+USB     2023    253,160  item_heading   partial  1,8
+PNC     2025    856,173  item_heading   located  1,1A,7,8,9A
+PNC     2024    889,369  item_heading   located  1,1A,7,8,9A
+PNC     2023    892,456  item_heading   located  1,1A,7,8,9A
+TFC     2025    690,202  item_heading   located  1,1A,7,8,9A
+TFC     2024    679,972  item_heading   located  1,1A,7,8,9A
+TFC     2023    683,750  item_heading   located  1,1A,7,8,9A
+RF      2025    703,830  item_heading   located  1,1A,7,8,9A
+RF      2024    733,104  item_heading   located  1,1A,7,8,9A
+RF      2023    705,626  item_heading   partial  1,1A,7,8
+FITB    2025    825,921  item_heading   located  1,1A,7,8,9A
+FITB    2024    871,794  item_heading   located  1,1A,7,8,9A
+FITB    2023    913,501  item_heading   located  1,1A,7,8,9A
+CFG     2025    584,930  item_heading   located  1,1A,7,8,9A
+CFG     2024    568,727  item_heading   located  1,1A,7,8,9A
+CFG     2023    577,422  item_heading   located  1,1A,7,8,9A
+V       2025    422,108  item_heading   located  1,1A,7,7A,8,9A
+V       2024    393,330  item_heading   located  1,1A,7,7A,8,9A
+V       2023    368,382  item_heading   located  1,1A,7,7A,8,9A
+MA      2025    421,734  item_heading   located  1,1A,7,7A,8,9A
+MA      2024    425,591  item_heading   located  1,1A,7,7A,8,9A
+MA      2023    432,574  item_heading   located  1,1A,7,7A,8,9A
+JEF     2025    572,387  item_heading   located  1,1A,3,7,8,9A
+JEF     2024    584,724  item_heading   located  1,1A,3,7,8,9A
+JEF     2023    623,789  item_heading   located  1,1A,7,8,9A
+AAPL    2025    192,924  item_heading   located  1,1A,3,7,7A,8,9A
+AAPL    2024    190,809  item_heading   located  1,1A,3,7,7A,8,9A
+AAPL    2023    187,747  item_heading   located  1,1A,3,7,7A,8,9A
+------------------------------------------------------------------------
+core items 1A, 7, 9A located in 46/60 (77%)   crossref_pages=3  item_heading=54  none=3
+
+  PARTIAL  SYF FY2023 (syf-20231231.htm)
+    item headings located but sections are implausibly short
+    not located: 3, 8, 9A
+
+  PARTIAL  JPM FY2025 (jpm-20251231.htm)
+    content incorporated by reference; item headings are stubs
+    too short to be real: 3, 7, 7A, 8
+    incorporated by reference: 3, 7, 7A, 8
+
+  PARTIAL  JPM FY2024 (jpm-20241231.htm)
+    content incorporated by reference; item headings are stubs
+    too short to be real: 3, 7, 7A, 8
+    incorporated by reference: 3, 7, 7A, 8
+
+  PARTIAL  JPM FY2023 (jpm-20231231.htm)
+    content incorporated by reference; item headings are stubs
+    too short to be real: 3, 7, 7A, 8
+    incorporated by reference: 3, 7, 7A, 8
+
+  FAILED   C FY2025 (c-20251231.htm)
+    no item headings and no usable page table
+    not located: 1, 1A, 3, 7, 7A, 8, 9A
+
+  FAILED   C FY2024 (c-20241231.htm)
+    no item headings and no usable page table
+    not located: 1, 1A, 3, 7, 7A, 8, 9A
+
+  FAILED   C FY2023 (c-20231231.htm)
+    no item headings and no usable page table
+    not located: 1, 1A, 3, 7, 7A, 8, 9A
+
+  PARTIAL  WFC FY2025 (wfc-20251231_d2.htm)
+    content incorporated by reference; item headings are stubs
+    too short to be real: 1A, 3, 7, 7A, 8, 9A
+    incorporated by reference: 1A, 3, 7, 7A, 8, 9A
+
+  PARTIAL  WFC FY2024 (wfc-20241231.htm)
+    content incorporated by reference; item headings are stubs
+    too short to be real: 1A, 3, 7, 7A, 8, 9A
+    incorporated by reference: 1A, 3, 7, 7A, 8, 9A
+
+  PARTIAL  WFC FY2023 (wfc-20231231.htm)
+    content incorporated by reference; item headings are stubs
+    too short to be real: 1A, 3, 7, 7A, 8, 9A
+    incorporated by reference: 1A, 3, 7, 7A, 8, 9A
+
+  PARTIAL  USB FY2025 (usb-20251231.htm)
+    content incorporated by reference; item headings are stubs
+    too short to be real: 1A, 3, 7, 7A, 8, 9A
+    incorporated by reference: 1A, 3, 7, 7A, 8, 9A
+
+  PARTIAL  USB FY2024 (usb-20241231.htm)
+    content incorporated by reference; item headings are stubs
+    too short to be real: 1A, 3, 7, 7A, 8, 9A
+    incorporated by reference: 1A, 3, 7, 7A, 8, 9A
+
+  PARTIAL  USB FY2023 (usb-20231231.htm)
+    content incorporated by reference; item headings are stubs
+    too short to be real: 1A, 3, 7, 7A, 9A
+    incorporated by reference: 1A, 3, 7, 7A, 9A
+
+  PARTIAL  RF FY2023 (rf-20231231.htm)
+    item headings located but sections are implausibly short
+    too short to be real: 3, 7A, 9A
+    incorporated by reference: 3, 7A
+
+offsets round-trip: OK across 60 filings
+item_aware: 14,043 chunks  median 696 tokens  p95 795 tokens
+
+Below the 90% threshold. Every shortfall is listed above.

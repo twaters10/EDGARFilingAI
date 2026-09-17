@@ -23,6 +23,17 @@ def submissions_url(cik: str | int) -> str:
     return f"{SEC_DATA}/submissions/{to_data_api_cik(cik)}.json"
 
 
+def submissions_page_url(name: str) -> str:
+    """One page of a heavy filer's older filing history.
+
+    ``filings.recent`` caps at ~1000 rows. Everything older is split across the
+    pages named in ``filings.files``; this builds the URL for one of them. The
+    name is used as given -- SEC supplies it, and rebuilding it from a CIK is
+    how the three CIK renderings get mixed up.
+    """
+    return f"{SEC_DATA}/submissions/{name}"
+
+
 def companyfacts_url(cik: str | int) -> str:
     """All XBRL facts for one company.
 
