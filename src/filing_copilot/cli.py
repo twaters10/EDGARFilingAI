@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import shutil
 import sys
+import time
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Annotated
 
 import typer
@@ -13,6 +15,15 @@ from .config import ConfigError, Settings, get_settings
 from .edgar import EdgarClient, TickerResolver, UnknownTickerError, normalize_cik
 from .edgar.endpoints import company_tickers_url, companyfacts_bulk_url, submissions_url
 from .edgar.identifiers import Company, InvalidCIKError
+from .embed import (
+    NOMIC_EMBED_TEXT,
+    EmbeddingCache,
+    EmbeddingModel,
+    EncoderError,
+    OllamaEncoder,
+    embed_missing,
+    plan_corpus,
+)
 from .filings import (
     CHUNKERS,
     TARGET_ITEMS,
@@ -23,11 +34,22 @@ from .filings import (
     build_report,
     download_corpus,
     find_sections,
+    load_filing_texts,
     normalize,
     verify_offsets,
 )
 from .filings.download import MAX_HISTORY_PAGES, CompanyDownload, download_company
 from .filings.index import IncompleteFilingIndexError
+from .index import (
+    IndexBuildError,
+    OpenSearchClient,
+    OpenSearchError,
+    build_index,
+    index_name,
+    manifest_path,
+    read_manifest,
+    write_manifest,
+)
 from .structured import (
     AS_REPORTED,
     AS_RESTATED,
@@ -499,54 +521,8 @@ def sections(
     not the percentage.
     """
     settings = _load_settings()
-
-    if chunker not in CHUNKERS:
-        typer.secho(
-            f"--chunker must be one of {', '.join(sorted(CHUNKERS))}, got {chunker!r}.",
-            fg=typer.colors.RED,
-            err=True,
-        )
-        raise typer.Exit(code=2)
-
-    try:
-        corpus = Corpus.load(settings.corpus_path)
-    except CorpusError as exc:
-        typer.secho(str(exc), fg=typer.colors.RED, err=True)
-        raise typer.Exit(code=2) from exc
-
-    docs: list[FilingText] = []
-    with EdgarClient(settings) as client:
-        try:
-            downloaded = download_corpus(client, corpus, years=years)
-        except IncompleteFilingIndexError as exc:
-            typer.secho(str(exc), fg=typer.colors.RED, err=True)
-            raise typer.Exit(code=1) from exc
-
-        if client.request_count:
-            typer.secho(
-                f"note: {client.request_count} request(s) -- the cache was cold.",
-                fg=typer.colors.YELLOW,
-            )
-
-    for company in downloaded.companies:
-        entry = corpus.by_ticker(company.ticker)
-        for document in company.documents:
-            text = normalize(document.path.read_bytes())
-            docs.append(
-                FilingText(
-                    ref=document.ref,
-                    ticker=company.ticker,
-                    company_name=entry.name,
-                    text=text,
-                    sections=find_sections(text),
-                )
-            )
-
-    if not docs:
-        typer.secho(
-            "No filings on disk. Run 'fc fetch-filings' first.", fg=typer.colors.RED, err=True
-        )
-        raise typer.Exit(code=2)
+    _check_chunker(chunker)
+    docs = _load_corpus_texts(settings, years)
 
     typer.echo(f"{'ticker':<8}{'FY':<6}{'chars':>9}  {'strategy':<15}{'state':<9}items")
     typer.echo("-" * 72)
@@ -564,6 +540,41 @@ def sections(
 
     if not report.meets(threshold):
         raise typer.Exit(code=1)
+
+
+def _load_corpus_texts(settings: Settings, years: int) -> list[FilingText]:
+    """Every corpus filing as :class:`FilingText`, read from the download cache.
+
+    Shared by ``sections`` and ``embed`` so the coverage report describes the
+    exact text that gets indexed. Makes no requests when the cache is warm, and
+    says so when it was not.
+    """
+    try:
+        corpus = Corpus.load(settings.corpus_path)
+    except CorpusError as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2) from exc
+
+    with EdgarClient(settings) as client:
+        try:
+            downloaded = download_corpus(client, corpus, years=years)
+        except IncompleteFilingIndexError as exc:
+            typer.secho(str(exc), fg=typer.colors.RED, err=True)
+            raise typer.Exit(code=1) from exc
+
+        if client.request_count:
+            typer.secho(
+                f"note: {client.request_count} request(s) -- the cache was cold.",
+                fg=typer.colors.YELLOW,
+            )
+
+    docs = load_filing_texts(downloaded, corpus)
+    if not docs:
+        typer.secho(
+            "No filings on disk. Run 'fc fetch-filings' first.", fg=typer.colors.RED, err=True
+        )
+        raise typer.Exit(code=2)
+    return docs
 
 
 def _print_coverage_summary(
@@ -718,3 +729,147 @@ def _pick_filing(documents: list[FilingDocument], ticker: str, fy: int | None) -
         f"{ticker} has no FY{fy} filing on disk. Available: {years}.", fg=typer.colors.RED, err=True
     )
     raise typer.Exit(code=2)
+
+
+# --- Stage 3: embeddings --------------------------------------------------------
+
+
+def _embedding_model(settings: Settings) -> EmbeddingModel:
+    """The configured model, refusing any whose prefix behaviour is unverified.
+
+    ``needs_task_prefix`` and ``max_input_chars`` were measured for nomic on this
+    Ollama build. Accepting another name here would reuse those measurements for a
+    model they were never taken on -- a silent retrieval regression (ADR-0009).
+    """
+    if settings.embedding_model != NOMIC_EMBED_TEXT.name:
+        typer.secho(
+            f"EMBEDDING_MODEL={settings.embedding_model!r} is not verified. Only "
+            f"{NOMIC_EMBED_TEXT.name!r} has measured prefix and input-length behaviour "
+            f"(see ADR-0009 and tests/test_encoder.py).",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    return replace(NOMIC_EMBED_TEXT, dimensions=settings.embedding_dimensions)
+
+
+def _check_chunker(chunker: str) -> None:
+    if chunker not in CHUNKERS:
+        typer.secho(
+            f"--chunker must be one of {', '.join(sorted(CHUNKERS))}, got {chunker!r}.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+
+ChunkerOpt = Annotated[
+    str, typer.Option("--chunker", help="item_aware (default) or fixed_window, the A/B baseline.")
+]
+
+
+@app.command("embed")
+def embed(
+    chunker: ChunkerOpt = "item_aware",
+    years: Annotated[int, typer.Option("--years", help="Annual filings per company.")] = 3,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Count cache hits and misses; embed nothing.")
+    ] = False,
+) -> None:
+    """Chunk the corpus, embed only what the cache lacks, and write the manifest.
+
+    Safe to re-run: a second run over an unchanged corpus embeds nothing. An
+    interrupted run keeps every completed batch.
+    """
+    settings = _load_settings()
+    _check_chunker(chunker)
+    model = _embedding_model(settings)
+
+    docs = _load_corpus_texts(settings, years)
+    plan = plan_corpus(docs, CHUNKERS[chunker], model)
+    cache = EmbeddingCache(settings.embeddings_dir)
+    missing = len(plan.inputs.keys() - cache.cached_digests(model))
+
+    typer.echo(
+        f"{chunker}: {len(docs)} filings, {len(plan.rows):,} chunks, "
+        f"{len(plan.inputs):,} distinct inputs for {model.cache_key}"
+    )
+    typer.echo(f"cached: {len(plan.inputs) - missing:,}   to embed: {missing:,}")
+    if dry_run:
+        return
+
+    started = time.monotonic()
+
+    def report(done: int, total: int) -> None:
+        elapsed = time.monotonic() - started
+        remaining = elapsed / done * (total - done)
+        typer.echo(f"  {done:,}/{total:,}  {elapsed:,.0f}s elapsed, ~{remaining:,.0f}s left")
+
+    try:
+        with OllamaEncoder(host=settings.ollama_host, model=model) as encoder:
+            result = embed_missing(encoder, cache, plan.inputs, on_batch=report)
+    except EncoderError as exc:
+        typer.secho(
+            f"{exc}\nCompleted batches are saved; re-run to resume.", fg=typer.colors.RED, err=True
+        )
+        raise typer.Exit(code=1) from exc
+
+    path = manifest_path(settings.manifests_dir, chunker, model.cache_key)
+    write_manifest(plan.rows, path)
+
+    stats = cache.stats(model)
+    typer.echo(
+        f"embedded {result.embedded:,} in {time.monotonic() - started:,.0f}s; "
+        f"{result.already_cached:,} were already cached"
+    )
+    typer.echo(
+        f"cache:    {stats.vectors:,} vectors, {stats.parts} part(s), "
+        f"{stats.total_bytes / 1_048_576:.1f} MiB  ({cache.directory_for(model)})"
+    )
+    typer.echo(f"manifest: {len(plan.rows):,} rows  ({path})")
+
+
+@app.command("build-index")
+def build_index_command(chunker: ChunkerOpt = "item_aware") -> None:
+    """Rebuild the search index from the manifest and the embedding cache.
+
+    Makes no EDGAR requests and no Ollama calls: everything it indexes was stored
+    by ``fc embed``. If anything is missing it stops before the old index is
+    touched.
+    """
+    settings = _load_settings()
+    _check_chunker(chunker)
+    model = _embedding_model(settings)
+
+    path = manifest_path(settings.manifests_dir, chunker, model.cache_key)
+    if not path.exists():
+        typer.secho(
+            f"No manifest at {path}. Run 'fc embed --chunker {chunker}' first.",
+            fg=typer.colors.RED,
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    started = time.monotonic()
+    rows = read_manifest(path)
+    name = index_name(settings.opensearch_index_prefix, chunker)
+    typer.echo(f"{name}: {len(rows):,} rows from {path}")
+
+    def report(done: int, total: int) -> None:
+        typer.echo(f"  {done:,}/{total:,}  {time.monotonic() - started:,.1f}s")
+
+    try:
+        with OpenSearchClient(settings.opensearch_url) as client:
+            typer.echo(f"OpenSearch {client.ping()} at {settings.opensearch_url}")
+            result = build_index(
+                rows, EmbeddingCache(settings.embeddings_dir), model, client, name, on_batch=report
+            )
+    except (IndexBuildError, OpenSearchError) as exc:
+        typer.secho(str(exc), fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=1) from exc
+
+    verb = "rebuilt" if result.replaced_existing else "created"
+    typer.echo(
+        f"{verb} {result.index}: {result.documents:,} documents verified by _count "
+        f"in {time.monotonic() - started:,.1f}s -- 0 embeddings computed"
+    )

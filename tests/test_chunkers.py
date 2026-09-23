@@ -232,3 +232,28 @@ def test_section_path_records_form_and_item(doc: FilingText) -> None:
     chunk = item_aware(doc)[0]
     assert chunk.section_path == "10-K > Item 1. Business"
     assert fixed_window(doc)[0].section_path == "10-K"
+
+
+# --- the contextual prefix is a frozen contract -------------------------------
+#
+# The embedding cache keys on the exact string sent to the model, which includes
+# this prefix. Changing its format is therefore a corpus-wide re-embed: ~15
+# minutes at 14,043 chunks, several hours at S&P 500 scale. That is the correct
+# behaviour, but it should be a deliberate choice rather than a side effect of
+# tidying a docstring -- so the exact output is pinned here.
+#
+# If you meant to change it: update this test in the same commit, and expect the
+# next build to re-embed everything.
+
+
+def test_contextual_prefix_format_is_pinned(doc: FilingText) -> None:
+    assert contextual_prefix(doc, "1A") == (
+        "Synchrony Financial (SYF) · 10-K · period ending 2025-12-31 · Item 1A. Risk Factors"
+    )
+
+
+def test_contextual_prefix_without_an_item_is_pinned(doc: FilingText) -> None:
+    """The fixed_window baseline has no item, and still needs a stable key."""
+    assert contextual_prefix(doc, "") == (
+        "Synchrony Financial (SYF) · 10-K · period ending 2025-12-31 · full document"
+    )

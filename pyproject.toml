@@ -27,6 +27,11 @@ dev = [
     "lxml-stubs>=0.5",
     "types-PyYAML>=6.0",
 ]
+notebook = [
+    "ipykernel>=7.3.0",
+    "nbconvert>=7.17.1",
+    "pandas>=3.0.6",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -62,6 +67,6 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
-    "network: test hits live SEC EDGAR (deselected by default; run with -m network)",
+    "network: test hits a live service -- SEC EDGAR, local Ollama, or local OpenSearch\n    (deselected by default; run with -m network)",
 ]
 addopts = "-m 'not network'"

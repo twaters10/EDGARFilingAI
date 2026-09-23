@@ -1,0 +1,30 @@
+# Local OpenSearch for Stages 3-7. Stage 8 replaces this with OpenSearch
+# Serverless (NextGen -- never Classic, ADR-0012) behind the same settings.
+#
+#   colima start --cpu 2 --memory 4 --disk 20
+#   docker compose up -d
+#   curl localhost:9200
+#
+# Security is disabled because this binds to localhost only and holds nothing but
+# public SEC filings. Do not copy this configuration anywhere reachable.
+services:
+  opensearch:
+    image: opensearchproject/opensearch:2.19.1
+    container_name: filing-copilot-opensearch
+    environment:
+      - discovery.type=single-node
+      - DISABLE_SECURITY_PLUGIN=true
+      - DISABLE_INSTALL_DEMO_CONFIG=true
+      # A fixed 1 GB heap: enough for ~14k 768-d vectors, and bounded on a 16 GB laptop.
+      - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
+      - bootstrap.memory_lock=true
+    ulimits:
+      memlock: { soft: -1, hard: -1 }
+      nofile: { soft: 65536, hard: 65536 }
+    ports:
+      - "127.0.0.1:9200:9200"
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+
+volumes:
+  opensearch-data:

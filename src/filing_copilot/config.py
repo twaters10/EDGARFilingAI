@@ -46,6 +46,36 @@ class Settings(BaseSettings):
     edgar_max_retries: int = Field(default=5, ge=0, le=10)
     edgar_timeout_seconds: float = Field(default=30.0, gt=0)
 
+    # --- Embeddings --------------------------------------------------------
+    ollama_host: str = Field(
+        default="http://localhost:11434",
+        description="Local Ollama server. Stage 8 swaps the encoder, not this.",
+    )
+    embedding_model: str = Field(
+        default="nomic-embed-text",
+        description="Model name as Ollama knows it. Part of the embedding cache key.",
+    )
+    embedding_dimensions: int = Field(
+        default=768,
+        gt=0,
+        le=768,
+        description=(
+            "Vector width. 768 is nomic's native size; 256 is viable via Matryoshka "
+            "truncation, unverified on this build. Part of the embedding cache key."
+        ),
+    )
+
+    # --- Search index ------------------------------------------------------
+    opensearch_url: str = Field(
+        default="http://localhost:9200",
+        description="Local Docker OpenSearch until Stage 8 points this at Serverless.",
+    )
+    opensearch_index_prefix: str = Field(
+        default="filings",
+        pattern=r"^[a-z][a-z0-9_-]*$",
+        description="Indexes are named <prefix>-<chunker>, one per chunking strategy.",
+    )
+
     # --- Storage -----------------------------------------------------------
     data_dir: Path = Field(default=Path("data"))
     corpus_path: Path = Field(
@@ -98,6 +128,16 @@ class Settings(BaseSettings):
     def facts_dir(self) -> Path:
         """Root of the partitioned fact table: cik=<cik>/fiscal_year=<yyyy>/."""
         return self.processed_dir / "facts"
+
+    @property
+    def embeddings_dir(self) -> Path:
+        """Root of the embedding cache: one directory of Parquet parts per model."""
+        return self.processed_dir / "embeddings"
+
+    @property
+    def manifests_dir(self) -> Path:
+        """One manifest per chunker and model -- what ``build-index`` rebuilds from."""
+        return self.processed_dir / "manifests"
 
 
 @lru_cache(maxsize=1)

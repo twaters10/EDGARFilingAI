@@ -11,6 +11,7 @@ from .chunkers import (
     item_aware,
     item_label,
 )
+from .corpus_text import load_filing_texts
 from .coverage import CORE_ITEMS, CoverageReport, FilingCoverage, build_report, verify_offsets
 from .crossref import find_sections_by_page, page_index, parse_page_references
 from .download import (
@@ -71,6 +72,7 @@ __all__ = [
     "is_data_table",
     "item_aware",
     "item_label",
+    "load_filing_texts",
     "normalize",
     "page_index",
     "parse_page_references",
