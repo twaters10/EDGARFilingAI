@@ -17,11 +17,13 @@ from filing_copilot.filings.chunkers import (
     MIN_CHUNK_CHARS,
     OVERLAP_FRACTION,
     Chunk,
+    DocumentPart,
     FilingText,
     contextual_prefix,
     fixed_window,
     item_aware,
     item_label,
+    labelled_segments,
     target_chars,
 )
 from filing_copilot.filings.index import FilingRef
@@ -97,32 +99,33 @@ def test_chunk_ids_are_unique_and_deterministic(name: str, doc: FilingText) -> N
 def test_item_aware_never_straddles_an_item_boundary(doc: FilingText) -> None:
     """A chunk half about risk and half about results is attributed to one."""
     for chunk in item_aware(doc):
-        section = doc.sections[chunk.item]
-        assert section.char_start <= chunk.char_start
-        assert chunk.char_end <= section.char_end
+        for item in chunk.items:
+            spans = doc.sections[item].spans
+            assert any(lo <= chunk.char_start and chunk.char_end <= hi for lo, hi in spans)
 
 
 def test_item_aware_attributes_text_to_the_right_item(doc: FilingText) -> None:
     for chunk in item_aware(doc):
-        expected = {"1": "Business", "1A": "Risk", "7": "Results"}[chunk.item]
+        (item,) = chunk.items
+        expected = {"1": "Business", "1A": "Risk", "7": "Results"}[item]
         assert expected in chunk.text
 
 
 def test_fixed_window_carries_no_item_attribution(doc: FilingText) -> None:
     """The baseline has no structure to report, and must not pretend otherwise."""
-    assert {c.item for c in fixed_window(doc)} == {""}
+    assert {c.items for c in fixed_window(doc)} == {()}
 
 
 def test_chunks_overlap_so_a_boundary_cannot_hide_a_sentence(doc: FilingText) -> None:
     chunks = item_aware(doc)
-    risk = [c for c in chunks if c.item == "1A"]
+    risk = [c for c in chunks if c.items == ("1A",)]
     assert len(risk) > 1
     assert risk[1].char_start < risk[0].char_end
 
 
 def seam_overlaps(chunks: list[Chunk]) -> list[int]:
     """Characters shared by each consecutive pair within the same item."""
-    return [a.char_end - b.char_start for a, b in pairwise(chunks) if a.item == b.item]
+    return [a.char_end - b.char_start for a, b in pairwise(chunks) if a.items == b.items]
 
 
 def test_every_seam_overlaps_by_the_configured_amount() -> None:
@@ -163,7 +166,7 @@ def test_overlap_scales_with_the_setting() -> None:
 
 
 def test_zero_overlap_is_contiguous(doc: FilingText) -> None:
-    risk = [c for c in item_aware(doc, overlap=0.0) if c.item == "1A"]
+    risk = [c for c in item_aware(doc, overlap=0.0) if c.items == ("1A",)]
     assert all(b.char_start == a.char_end for a, b in pairwise(risk))
 
 
@@ -197,7 +200,7 @@ def test_item_aware_covers_the_extra_spans_of_a_crossref_section() -> None:
 
 
 def test_items_can_be_restricted(doc: FilingText) -> None:
-    assert {c.item for c in item_aware(doc, items=["1A"])} == {"1A"}
+    assert {c.items for c in item_aware(doc, items=["1A"])} == {("1A",)}
 
 
 def test_an_unsectioned_filing_yields_no_item_aware_chunks() -> None:
@@ -209,7 +212,7 @@ def test_an_unsectioned_filing_yields_no_item_aware_chunks() -> None:
 
 
 def test_contextual_prefix_situates_the_chunk(doc: FilingText) -> None:
-    prefix = contextual_prefix(doc, "1A")
+    prefix = contextual_prefix(doc, ("1A",))
     assert "Synchrony Financial" in prefix
     assert "SYF" in prefix
     assert "10-K" in prefix
@@ -219,7 +222,7 @@ def test_contextual_prefix_situates_the_chunk(doc: FilingText) -> None:
 
 def test_the_prefix_is_never_folded_into_the_stored_text(doc: FilingText) -> None:
     """Folding it in would break the offset round-trip and put words in a filing's mouth."""
-    prefix = contextual_prefix(doc, "1A")
+    prefix = contextual_prefix(doc, ("1A",))
     assert all(not c.text.startswith(prefix) for c in item_aware(doc))
 
 
@@ -247,13 +250,113 @@ def test_section_path_records_form_and_item(doc: FilingText) -> None:
 
 
 def test_contextual_prefix_format_is_pinned(doc: FilingText) -> None:
-    assert contextual_prefix(doc, "1A") == (
+    assert contextual_prefix(doc, ("1A",)) == (
         "Synchrony Financial (SYF) · 10-K · period ending 2025-12-31 · Item 1A. Risk Factors"
+    )
+
+
+def test_contextual_prefix_for_two_items_is_pinned(doc: FilingText) -> None:
+    """Text a filer declares for two items names both, in 10-K order."""
+    assert contextual_prefix(doc, ("7", "7A")) == (
+        "Synchrony Financial (SYF) · 10-K · period ending 2025-12-31 · "
+        "Item 7. Management's Discussion and Analysis; "
+        "Item 7A. Quantitative and Qualitative Disclosures About Market Risk"
     )
 
 
 def test_contextual_prefix_without_an_item_is_pinned(doc: FilingText) -> None:
     """The fixed_window baseline has no item, and still needs a stable key."""
-    assert contextual_prefix(doc, "") == (
+    assert contextual_prefix(doc, ()) == (
         "Synchrony Financial (SYF) · 10-K · period ending 2025-12-31 · full document"
     )
+
+
+# --- overlapping declarations: chunked once, labelled with every item ---------
+
+
+def overlapping_doc() -> FilingText:
+    """Citigroup's shape: Item 7 declares [0, B); Item 7A declares [A, B) inside it."""
+    text = paragraphs("Results", 20) + paragraphs("Market", 20)
+    split = len(paragraphs("Results", 20))
+    return FilingText(
+        ref=REF,
+        ticker="C",
+        company_name="Citigroup",
+        text=text,
+        sections={
+            "7": Section(item="7", heading_start=0, char_start=0, char_end=len(text)),
+            "7A": Section(item="7A", heading_start=split, char_start=split, char_end=len(text)),
+        },
+    )
+
+
+def test_segments_label_shared_text_with_both_items() -> None:
+    doc = overlapping_doc()
+    segments = labelled_segments(doc.sections)
+    assert [s.items for s in segments] == [("7",), ("7", "7A")]
+    assert segments[0].end == segments[1].start
+
+
+def test_shared_text_is_chunked_once_not_twice() -> None:
+    """The double-indexing the old per-section chunker produced for SYF Item 3."""
+    chunks = item_aware(overlapping_doc())
+    starts = [c.char_start for c in chunks]
+    assert len(starts) == len(set(starts))
+    market = [c for c in chunks if "Market" in c.text]
+    assert market and all(c.items == ("7", "7A") for c in market)
+
+
+def test_a_filter_on_either_item_finds_the_shared_text() -> None:
+    doc = overlapping_doc()
+    for item in ("7", "7A"):
+        assert any("Market" in c.text for c in item_aware(doc, items=[item]))
+
+
+def test_chunk_ids_are_accession_and_start_offset(doc: FilingText) -> None:
+    """Independent of labelling, so relabelling a span cannot change an id."""
+    chunk = item_aware(doc)[0]
+    assert chunk.chunk_id == f"{REF.accession}:{chunk.char_start}"
+
+
+# --- a filing made of two documents -----------------------------------------------
+
+
+def two_document_doc() -> FilingText:
+    """A 10-K wrapper followed by its Annual Report exhibit, as one text."""
+    wrapper = paragraphs("Wrapper", 10)
+    exhibit = paragraphs("Annual", 20)
+    text = wrapper + "\n\n" + exhibit
+    exhibit_start = len(wrapper) + 2
+    return FilingText(
+        ref=REF,
+        ticker="WFC",
+        company_name="Wells Fargo",
+        text=text,
+        sections={
+            "1A": Section(
+                item="1A", heading_start=exhibit_start, char_start=exhibit_start, char_end=len(text)
+            ),
+        },
+        documents=(
+            DocumentPart("wfc-10k.htm", 0, len(wrapper)),
+            DocumentPart("wfc-ex13.htm", exhibit_start, len(text)),
+        ),
+    )
+
+
+def test_chunks_name_the_document_they_came_from() -> None:
+    doc = two_document_doc()
+    assert {c.document for c in item_aware(doc)} == {"wfc-ex13.htm"}
+
+
+def test_fixed_window_never_spans_two_documents() -> None:
+    doc = two_document_doc()
+    wrapper_end = doc.parts[0].end
+    for chunk in fixed_window(doc):
+        assert chunk.char_end <= wrapper_end or chunk.char_start >= doc.parts[1].start
+
+
+def test_text_sha256_hashes_the_whole_normalized_text(doc: FilingText) -> None:
+    import hashlib
+
+    assert doc.text_sha256 == hashlib.sha256(doc.text.encode("utf-8")).hexdigest()

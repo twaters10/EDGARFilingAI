@@ -5,13 +5,16 @@ from .chunkers import (
     OVERLAP_FRACTION,
     TARGET_TOKENS,
     Chunk,
+    DocumentPart,
     FilingText,
+    Segment,
     contextual_prefix,
     fixed_window,
     item_aware,
     item_label,
+    labelled_segments,
 )
-from .corpus_text import load_filing_texts
+from .corpus_text import build_filing_text, load_filing_texts
 from .coverage import CORE_ITEMS, CoverageReport, FilingCoverage, build_report, verify_offsets
 from .crossref import find_sections_by_page, page_index, parse_page_references
 from .download import (
@@ -51,6 +54,7 @@ __all__ = [
     "Chunk",
     "CompanyDownload",
     "CoverageReport",
+    "DocumentPart",
     "DownloadReport",
     "FilingCoverage",
     "FilingDocument",
@@ -58,7 +62,9 @@ __all__ = [
     "FilingText",
     "IncompleteFilingIndexError",
     "Section",
+    "Segment",
     "assert_complete",
+    "build_filing_text",
     "build_report",
     "contextual_prefix",
     "coverage_window",
@@ -72,6 +78,7 @@ __all__ = [
     "is_data_table",
     "item_aware",
     "item_label",
+    "labelled_segments",
     "load_filing_texts",
     "normalize",
     "page_index",

@@ -46,7 +46,7 @@ def companyfacts_url(cik: str | int) -> str:
 def companyfacts_bulk_url() -> str:
     """Every company's XBRL facts in one ~1.2GB zip.
 
-    Read members in place with :mod:`zipfile`; extracted it is roughly 15GB.
+    Read members in place with :mod:`zipfile`; extracted it is roughly 18GB.
     """
     return f"{SEC_WWW}/Archives/edgar/daily-index/xbrl/companyfacts.zip"
 
@@ -54,6 +54,19 @@ def companyfacts_bulk_url() -> str:
 def filing_index_url(cik: str | int, accession: str) -> str:
     """JSON index of the documents in one filing."""
     return f"{SEC_WWW}/Archives/edgar/data/{to_archives_cik(cik)}/{_bare(accession)}/index.json"
+
+
+def filing_index_page_url(cik: str | int, accession: str) -> str:
+    """HTML index of one filing -- the only one that states each document's *type*.
+
+    ``index.json`` lists the files but not what they are. Telling a 10-K's
+    Annual Report exhibit (``EX-13``) from its other attachments needs the Type
+    column of this page.
+    """
+    return (
+        f"{SEC_WWW}/Archives/edgar/data/{to_archives_cik(cik)}/{_bare(accession)}/"
+        f"{accession}-index.htm"
+    )
 
 
 def filing_document_url(cik: str | int, accession: str, document: str) -> str:

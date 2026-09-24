@@ -1,4 +1,4 @@
-"""Fetch the primary document of every filing the corpus needs.
+"""Fetch the documents of every filing the corpus needs.
 
 This is a thin orchestration over machinery that already exists: the throttled,
 cached, retrying client from :mod:`filing_copilot.edgar.client` and the URL
@@ -16,18 +16,32 @@ The order of operations is the point:
    surfaces as a thin answer several stages later.
 5. Only then spend requests on documents.
 
+6. **Fetch any Annual Report exhibit (EX-13).** Wells Fargo and U.S. Bancorp
+   file a thin 10-K whose items say "can be found in the Annual Report"; the
+   Annual Report is a separate document in the same filing. SEC's
+   ``primaryDocument`` names only the 10-K, so the filing's own index is read
+   to find it.
+
 Step 4 sits before step 5 deliberately. Discovering truncation after fetching 40
 documents wastes rate budget and buries the message in a wall of progress lines.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from lxml import etree, html
+
 from ..edgar.client import EdgarClient, EdgarHTTPError
-from ..edgar.endpoints import filing_document_url, submissions_page_url, submissions_url
+from ..edgar.endpoints import (
+    filing_document_url,
+    filing_index_page_url,
+    submissions_page_url,
+    submissions_url,
+)
 from ..structured.corpus import Corpus, CorpusCompany
 from .index import (
     ANNUAL_FORMS,
@@ -55,10 +69,18 @@ class FilingDocument:
     path: Path
     cached: bool
     """True when the file was already in the cache and cost zero requests."""
+    exhibits: tuple[tuple[str, Path], ...] = ()
+    """``(document name, path)`` of each Annual Report exhibit the 10-K
+    incorporates, in filing order. Empty for a self-contained 10-K."""
+
+    @property
+    def parts(self) -> tuple[tuple[str, Path], ...]:
+        """Every document of this filing that holds item content, 10-K first."""
+        return ((self.ref.primary_document, self.path), *self.exhibits)
 
     @property
     def size_bytes(self) -> int:
-        return self.path.stat().st_size
+        return sum(path.stat().st_size for _, path in self.parts)
 
 
 @dataclass
@@ -139,6 +161,44 @@ def select_with_history(
     return selected
 
 
+# Document types that carry a 10-K's incorporated content. EX-13 is the Annual
+# Report to Security Holders; filers number it EX-13, EX-13.1 and so on.
+_ANNUAL_REPORT_TYPE = re.compile(r"^EX-13(?:\.\d+)?$", re.IGNORECASE)
+
+
+def annual_report_documents(index_html: bytes) -> list[str]:
+    """Names of the Annual Report exhibits listed in a filing's HTML index.
+
+    The index is a table (class ``tableFile``) whose header row names its
+    columns; ``Document`` and ``Type`` are located by header rather than by
+    position.
+    """
+    tree = html.fromstring(index_html)
+    for table in tree.iter("table"):
+        if "tableFile" not in (table.get("class") or ""):
+            continue
+        rows = [[cell for cell in row if cell.tag in ("th", "td")] for row in table.iter("tr")]
+        if not rows:
+            continue
+        header = [_cell_text(cell).lower() for cell in rows[0]]
+        if "document" not in header or "type" not in header:
+            continue
+        doc_col, type_col = header.index("document"), header.index("type")
+
+        names = []
+        for cells in rows[1:]:
+            if len(cells) <= max(doc_col, type_col):
+                continue
+            if not _ANNUAL_REPORT_TYPE.match(_cell_text(cells[type_col])):
+                continue
+            # The Document cell reads "wfc-20251231.htm iXBRL"; the first word is the name.
+            words = _cell_text(cells[doc_col]).split()
+            if words:
+                names.append(words[0])
+        return names
+    return []
+
+
 def download_company(
     client: EdgarClient,
     company: CorpusCompany,
@@ -147,8 +207,13 @@ def download_company(
     forms: Iterable[str] = ANNUAL_FORMS,
     refresh: bool = False,
     max_pages: int = MAX_HISTORY_PAGES,
+    follow_exhibits: bool = True,
 ) -> CompanyDownload:
-    """Fetch one company's annual primary documents.
+    """Fetch one company's annual documents: each 10-K and any Annual Report exhibit.
+
+    ``follow_exhibits`` reads each filing's index (one extra request per filing,
+    cached forever) to find an EX-13. It exists as a switch so tests of ordering
+    and caching can script only the requests they are about.
 
     Raises:
         IncompleteFilingIndexError: when filings we needed were never read.
@@ -169,10 +234,32 @@ def download_company(
             # let the caller decide; the report lists every failure by name.
             result.failures.append(f"{company.ticker} FY{ref.fiscal_year} {ref.accession}: {exc}")
             continue
+        exhibits: tuple[tuple[str, Path], ...] = ()
+        if follow_exhibits:
+            try:
+                exhibits = _download_exhibits(client, ref, refresh=refresh)
+            except EdgarHTTPError as exc:
+                # The 10-K itself is usable; say loudly that its exhibit is not.
+                result.failures.append(
+                    f"{company.ticker} FY{ref.fiscal_year} {ref.accession} exhibits: {exc}"
+                )
         result.documents.append(
-            FilingDocument(ref=ref, ticker=company.ticker, path=path, cached=was_cached)
+            FilingDocument(
+                ref=ref, ticker=company.ticker, path=path, cached=was_cached, exhibits=exhibits
+            )
         )
     return result
+
+
+def _download_exhibits(
+    client: EdgarClient, ref: FilingRef, *, refresh: bool
+) -> tuple[tuple[str, Path], ...]:
+    """Fetch every Annual Report exhibit a filing lists. Usually there are none."""
+    index = client.get(filing_index_page_url(ref.cik, ref.accession), refresh=refresh)
+    return tuple(
+        (name, client.download(filing_document_url(ref.cik, ref.accession, name), refresh=refresh))
+        for name in annual_report_documents(index)
+    )
 
 
 def download_corpus(
@@ -184,6 +271,7 @@ def download_corpus(
     refresh: bool = False,
     max_pages: int = MAX_HISTORY_PAGES,
     on_company: Callable[[CompanyDownload], None] | None = None,
+    follow_exhibits: bool = True,
 ) -> DownloadReport:
     """Fetch the whole corpus, reporting each company as it completes.
 
@@ -194,9 +282,21 @@ def download_corpus(
     report = DownloadReport()
     for company in corpus:
         result = download_company(
-            client, company, years=years, forms=forms, refresh=refresh, max_pages=max_pages
+            client,
+            company,
+            years=years,
+            forms=forms,
+            refresh=refresh,
+            max_pages=max_pages,
+            follow_exhibits=follow_exhibits,
         )
         report.companies.append(result)
         if on_company is not None:
             on_company(result)
     return report
+
+
+def _cell_text(element: etree._Element) -> str:
+    """An element's text with whitespace collapsed."""
+    pieces = (p if isinstance(p, str) else p.decode() for p in element.itertext())
+    return " ".join("".join(pieces).split())

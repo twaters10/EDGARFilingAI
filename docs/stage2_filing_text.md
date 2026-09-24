@@ -1,7 +1,7 @@
 # Stage 2 — Filing text: acquisition, sectioning, chunking
 
 > **Maintained by hand.** This document is not regenerated when code changes. It
-> describes the state of the pipeline as of **2026-09-17** and is updated only on
+> describes the state of the pipeline as of **2026-09-23** and is updated only on
 > request. If a number here disagrees with `fc sections`, trust `fc sections`.
 
 Turns 60 messy HTML filings into clean, section-attributed, citable chunks.
@@ -36,20 +36,24 @@ every step rather than assumed.
 ║        │                                                               ║
 ║        ▼                                                               ║
 ║   GET primary document          (www.sec.gov/Archives)  → cached       ║
+║        │                                                               ║
+║   GET filing index (-index.htm) → any EX-13?  ──YES──► GET it too      ║
+║        └─ WFC, USB: the 10-K is a wrapper; the Annual Report holds     ║
+║           the items. SEC's primaryDocument names only the wrapper.     ║
 ╚════════════════════════════╤═══════════════════════════════════════════╝
-                             ▼   60 filings · 400.6 MiB · 62 requests
+                             ▼   60 filings + 6 Annual Reports · cached
               ┌──────────────────────────────┐
               │ 2 · NORMALIZE   normalize.py │   HTML → text, 10.6x smaller
-              └──────────────┬───────────────┘
+              └──────────────┬───────────────┘   10-K + EX-13 joined into ONE string
                              ▼   offsets index THIS string
               ┌──────────────────────────────┐
-              │ 3 · SECTION     sections.py  │   locate Items 1A / 7 / 9A …
-              └──────────────┬───────────────┘
+              │ 3 · SECTION     sections.py  │   headings → referrals → page table
+              └──────────────┬───────────────┘   declared beats inferred
                              ▼
               ┌──────────────────────────────┐
               │ 4 · CHUNK       chunkers.py  │   item_aware | fixed_window
-              └──────────────┬───────────────┘
-                             ▼   14,043 chunks · median 696 tokens
+              └──────────────┬───────────────┘   labelled segments, multi-item
+                             ▼   16,370 chunks · median 694 tokens
               ┌──────────────────────────────┐
               │ 5 · REPORT      coverage.py  │   located | partial | failed
               └──────────────┬───────────────┘
@@ -176,6 +180,48 @@ published instead of guessing at headings.
 `Section.strategy` records which. The two rest on different evidence, and an
 aggregate that blurs them hides the thing worth watching.
 
+### Referrals — following an item that says "see elsewhere" (`referrals.py`)
+
+Four filers write some or all items as one-sentence pointers. The pointer is the
+filer's *declaration* of where the item lives, so it is followed rather than
+counted as a stub:
+
+```text
+   heading section, short, whose FIRST sentence is a referral
+        │
+        ├─ page references  "on pages 22 to 59"          USB (into its EX-13),
+        │     → the target document's page index           JPM (its bundled report)
+        │     → trimmed to a named heading if one sits
+        │       inside the first page ("under 'Risk Factors'")
+        │
+        ├─ heading references  "under 'Financial Review – Risk Factors'"   WFC
+        │     → walk the quoted path heading by heading
+        │     → end at the next title in the exhibit's own table of contents
+        │       (read from raw HTML — normalize turns it into a placeholder)
+        │
+        └─ into a note  "in Note 22 under 'Litigation and Regulatory Matters'"
+              → start inside that note, end at the next note         USB, RF, TFC
+```
+
+Four refusals, each learned from a real filing that broke without it:
+
+| Rule | Failure it prevents |
+|---|---|
+| Only the item's **first sentence** is read | JPM Item 2 is real content that ends "Refer to … pages 51–54"; Fifth Third's second sentence cites page 19 for forward-looking statements |
+| "beginning on page 81" is **not** a range | a start with no end resolved to one page of market-risk text labelled Item 1C (BAC) |
+| A heading with no known end **does not resolve** | running to end-of-document turned Mastercard's Item 10 into a 380,000-char span that erased every other section |
+| Items 10–14 are **never followed** | they point at the proxy statement, which is not in the filing |
+
+### Declared beats inferred
+
+A heading span is *inferred* — it runs to wherever the next heading happens to
+be. A referral or page-table span is *declared* by the filer. Where they overlap,
+the declared span is carved out of the inferred one. Without this, JPMorgan's
+Item 15 heading runs to the end of the file and claims its entire annual report.
+
+Declared spans may overlap **each other**, and are kept as declared: Citigroup
+lists pages 64–120 under both Item 7 and Item 7A. See §4 for how that is chunked.
+
 ---
 
 ## 4 · Chunk — two chunkers, one engine
@@ -210,10 +256,24 @@ aggregate that blurs them hides the thing worth watching.
                                └──► loop until the span is consumed
 ```
 
-| | scope | item label |
+| | scope | item labels |
 |---|---|---|
-| `item_aware` | inside each located section, never across an item boundary | yes |
-| `fixed_window` | the whole document, structure-blind | no — it has none to give |
+| `item_aware` | inside each labelled segment, never across a boundary | every item that claims the text |
+| `fixed_window` | each source document, structure-blind | none — it has none to give |
+
+**Labelled segments.** `item_aware` does not chunk section by section. It cuts the
+filing at every span boundary of every section, and labels each piece with the set
+of items whose spans cover it. Each character is chunked **once**; text two items
+both declare carries both labels, and a search filtered to either finds it.
+
+```text
+   Item 7  declares  ├──────────────── pages 8–36, 64–120 ──────────────┤
+   Item 7A declares                       ├──── 64–120 ────┤
+   segments          ├── (7) ───────────┤├── (7, 7A) ─────┤
+```
+
+(Before this, SYF's Item 3 — nested inside its Item 8 — was chunked, embedded and
+indexed twice under two labels.)
 
 `fixed_window` exists as the baseline Stage 4 measures `item_aware` against
 (ADR-0002). "Item-aware chunking is better" is a claim; two retrieval scores from
@@ -230,11 +290,13 @@ Each chunk carries:
 
 ```
 Chunk(chunk_id, cik, accession, form, period_end,
-      item, section_path, char_start, char_end, text)
+      items, section_path, document, char_start, char_end, text)
 ```
 
-`chunk_id` is `accession:item:char_start` — deterministic, so re-chunking the
-same filing the same way yields identical ids. The **contextual prefix is never
+`chunk_id` is `accession:char_start` — deterministic, and independent of the
+labels: each character is chunked once per chunker, so the start offset alone
+identifies a chunk. Relabelling a span after a better parse leaves ids unchanged.
+`document` names the source file (the 10-K, or its Annual Report). The **contextual prefix is never
 stored in `.text`**; it is built at embed time by `contextual_prefix()`. Folding
 it in would break the offset round trip and put words in a filing's mouth.
 
@@ -268,14 +330,13 @@ data/raw/submissions/                                11 MB   submissions.json + 
 The cache path mirrors SEC's own URL path (ADR-0013), so provenance is readable
 off the location. Entries never expire (ADR-0017) — a filed 10-K is immutable.
 
-**Normalized text and chunks are not persisted.** `normalize()` is a pure function
-held in memory; `fc sections` re-derives everything from cached HTML each run and
-throws it away. Persisting it is Stage 3 work, and it matters: `char_start` is
-meaningful only against one specific normalized string. The footer fix above
-shifted Capital One's text by 5,406 characters — had chunks been stored with
-offsets, every citation into that filing would have silently pointed at the wrong
-text. Stage 3 should store the text **and its hash**, so a normalization change
-is a detectable invalidation rather than a silent corruption.
+**Normalized text is re-derived, and its hash is kept.** `normalize()` is a pure
+function; `fc sections` re-derives everything from cached HTML each run.
+`char_start` is meaningful only against one specific normalized string — the
+footer fix above shifted Capital One's text by 5,406 characters — so Stage 3's
+manifest stores each chunk's text **and** `text_sha256`, the hash of the full
+normalized filing its offsets index. A normalization change is then a detectable
+invalidation rather than a silent corruption.
 
 ---
 
@@ -297,30 +358,32 @@ working, not a crash.
 ## Where it stands
 
 ```
-60 filings · 400.6 MiB · 62 requests
-core items 1A, 7, 9A located in 46/60 (77%)
-  item_heading 54 · crossref_pages 3 · none 3
+60 filings + 6 Annual Report exhibits (WFC, USB)
+core items 1A, 7, 9A located in 59/60 (98%)      — was 46/60 (77%) on 2026-09-17
+  item_heading 41 · referral 13 · crossref_pages 6
 offsets round-trip: OK across 60 filings
-item_aware: 14,043 chunks · median 696 tokens · p95 795
+item_aware: 16,370 chunks · median 694 tokens · p95 794 · 1,205 carry two items
 ```
 
-Below the 90% bar. The 14 shortfalls, all named by `fc sections`:
+Above the 90% bar. Every shortfall from the 2026-09-17 table is fixed:
 
-| | n | cause |
-|---|---|---|
-| WFC, USB | 6 | **acquisition bug** — SEC's `primaryDocument` points at a wrapper; WFC's real 10-K is an 11.6MB sibling in the same accession |
-| Citigroup | 3 | has a page table, but its left column is bare (`1A.` under an "Item Number" header) and ranges wrap across lines |
-| JPMorgan | 3 | bundled annual report with its own pagination; item headings are stubs citing pages 46–160 |
-| SYF FY2023, RF FY2023 | 2 | one-off partials, undiagnosed |
+| | n | was | fix |
+|---|---|---|---|
+| WFC, USB | 6 | 10-K wrapper only | fetch the EX-13; follow page and heading referrals into it |
+| Citigroup | 3 | page table unreadable | bare `1A.` item column; ranges rejoined across line wraps |
+| JPMorgan | 3 | page index covered pages 204–328 only | footer chain skips stray numbers; stubs followed by page |
+| SYF FY2023 | 1 | partial | page index now spans the whole filing |
 
-Fixing the first two would reach ~55/60 (92%). `PROJECT_PLAN.txt:314` flags this
-as the stage most likely to overrun and says to report rather than grind — hence
-the map instead of more patches.
+**The one remaining:** RF FY2023's Item 9A is real content that is only 980
+characters long — under the 1,000-character plausibility floor. Not a parser
+failure; the floor is doing its job conservatively, and lowering it to pass one
+filing would let genuine stubs through. Its Item 7A ("set forth in the Risk
+Management section of Item 7") names a section without quotes or pages, so it
+stays an unresolved referral, reported by name.
 
-**Also known:** Capital One and Citigroup list a single *start page* per item
-where Synchrony lists *ranges*. `crossref.py` assumes ranges, so enabling it for
-those filers without handling the distinction would collapse every span to about
-one page.
+**Not implemented:** page tables that list a single *start* page per item. No
+filer in the corpus needs it — Capital One sections by heading — so building it
+would be untestable against real data.
 
 ---
 

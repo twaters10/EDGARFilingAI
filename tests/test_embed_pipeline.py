@@ -97,7 +97,7 @@ def test_task_prefix_is_outermost_then_context_then_text(
     embed_missing(encoder, cache, plan.inputs)
 
     first = plan.rows[0]
-    expected = f"search_document: {contextual_prefix(doc, first.item)}\n\n{first.text}"
+    expected = f"search_document: {contextual_prefix(doc, first.items)}\n\n{first.text}"
     assert expected in encoder.sent
 
 

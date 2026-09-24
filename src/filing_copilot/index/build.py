@@ -58,6 +58,7 @@ def index_name(prefix: str, chunker: str) -> str:
 def to_document(row: ManifestRow, vector: Sequence[float]) -> dict[str, Any]:
     """One manifest row plus its vector, as the JSON OpenSearch stores."""
     document = asdict(row)
+    document["items"] = list(row.items)
     document["period_end"] = row.period_end.isoformat()
     document["embedding"] = list(vector)
     return document

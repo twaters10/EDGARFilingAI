@@ -30,7 +30,12 @@ which reads the filer's own page table instead of guessing at headings.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .referrals import OutlineEntry
 
 # Canonical 10-K item order. Position in this tuple is the rank the monotonic
 # constraint operates on.
@@ -68,6 +73,13 @@ TARGET_ITEMS: tuple[str, ...] = ("1", "1A", "3", "7", "7A", "8", "9A")
 # report that hides which one answered is hiding the thing worth knowing.
 ITEM_HEADING = "item_heading"
 CROSSREF = "crossref_pages"
+REFERRAL = "referral"
+"""An item heading whose one sentence ("can be found in the Annual Report on
+pages 22 to 59") was followed to the content -- see :mod:`.referrals`."""
+
+# Declared spans come from the filer's own statement of where an item lives; an
+# item-heading span is inferred from where the next heading happens to start.
+DECLARED = frozenset({CROSSREF, REFERRAL})
 
 # A heading at the start of its line, optionally preceded by "PART II" noise.
 _HEADING = re.compile(
@@ -106,14 +118,49 @@ class Section:
     char_end: int
     strategy: str = ITEM_HEADING
     extra_spans: tuple[tuple[int, int], ...] = ()
-    """Further disjoint spans the filer declared for this item, if any.
+    """Further disjoint spans belonging to this item, if any.
 
-    Only the cross-reference strategy produces these -- see :mod:`.crossref`.
+    A filer's page table can declare several ranges for one item, a referral can
+    name several headings, and a heading span can be split around a declared
+    span that sits inside it.
     """
 
     @property
     def length(self) -> int:
+        """Length of the primary span -- what coverage judges plausibility on."""
         return self.char_end - self.char_start
+
+    @property
+    def spans(self) -> tuple[tuple[int, int], ...]:
+        """Every span of this item, primary first."""
+        return ((self.char_start, self.char_end), *self.extra_spans)
+
+    @property
+    def declared(self) -> bool:
+        return self.strategy in DECLARED
+
+
+def section_from_spans(
+    item: str, spans: Sequence[tuple[int, int]], *, strategy: str, heading_start: int | None = None
+) -> Section | None:
+    """A section whose primary span is the first of ``spans``; ``None`` if empty."""
+    kept = [(start, end) for start, end in spans if end > start]
+    if not kept:
+        return None
+    (start, end), *extra = kept
+    return Section(
+        item=item,
+        heading_start=start if heading_start is None else heading_start,
+        char_start=start,
+        char_end=end,
+        strategy=strategy,
+        extra_spans=tuple(extra),
+    )
+
+
+def item_rank(item: str) -> int:
+    """Position of ``item`` in 10-K order, for sorting item labels."""
+    return _RANK.get(item.upper(), len(_RANK))
 
 
 def is_known_item(item: str) -> bool:
@@ -180,35 +227,95 @@ def longest_monotonic(candidates: list[Candidate]) -> list[Candidate]:
     return list(reversed(chain))
 
 
-def find_sections(text: str) -> dict[str, Section]:
+def find_sections(
+    text: str,
+    *,
+    parts: Sequence[tuple[int, int]] = (),
+    outline: Sequence[OutlineEntry] = (),
+) -> dict[str, Section]:
     """Locate item sections in normalized filing text.
 
-    Tries the item-heading strategy first and falls back to the filer's own
-    page table (:mod:`.crossref`) only when that finds nothing at all. The
-    fallback is a different and weaker kind of evidence, so it is never blended
-    with the primary result -- a filing is sectioned one way or the other, and
-    :attr:`Section.strategy` says which.
+    ``parts`` are the character ranges of the documents that make up the
+    filing, in order: the 10-K itself first, then any Annual Report exhibit it
+    incorporates. ``outline`` is that exhibit's table of contents.
+
+    1. **Item headings**, searched in the 10-K only, never into an exhibit.
+    2. **Referrals.** A heading that is only a pointer ("can be found in the
+       Annual Report on pages 22 to 59") is followed into the exhibit, or into
+       the filing itself when there is none (:mod:`.referrals`).
+    3. **The page table**, only when no heading is found at all (:mod:`.crossref`).
+    4. **Declared beats inferred.** Where a declared span (steps 2-3) overlaps a
+       heading span, the heading span gives way: JPMorgan's Item 15 heading
+       would otherwise run to the end of the file and claim its whole annual
+       report.
+
+    Declared spans may overlap *each other* -- Citigroup declares pages 64-120
+    for both Item 7 and Item 7A -- and are kept as declared. The chunker labels
+    such text with every item that claims it.
     """
-    sections = find_sections_by_heading(text)
-    if sections:
+    primary = parts[0] if parts else (0, len(text))
+    target = parts[-1] if parts else (0, len(text))
+
+    headings = find_sections_by_heading(text, end=primary[1])
+    if not headings:
+        from .crossref import find_sections_by_page  # crossref imports Section
+
+        return find_sections_by_page(text)
+
+    from .referrals import follow_referrals  # referrals imports crossref
+
+    sections = follow_referrals(text, headings, target=target, outline=outline)
+    return _declared_beats_inferred(sections)
+
+
+def _declared_beats_inferred(sections: dict[str, Section]) -> dict[str, Section]:
+    """Remove every declared span from every heading-inferred span."""
+    declared = sorted(span for s in sections.values() if s.declared for span in s.spans)
+    if not declared:
         return sections
 
-    from .crossref import find_sections_by_page  # imported here: crossref imports Section
+    result: dict[str, Section] = {}
+    for item, section in sections.items():
+        if section.declared:
+            result[item] = section
+            continue
+        pieces = [piece for span in section.spans for piece in _subtract(span, declared)]
+        trimmed = section_from_spans(
+            item, pieces, strategy=section.strategy, heading_start=section.heading_start
+        )
+        if trimmed is not None:
+            result[item] = trimmed
+    return result
 
-    return find_sections_by_page(text)
+
+def _subtract(span: tuple[int, int], holes: Sequence[tuple[int, int]]) -> list[tuple[int, int]]:
+    """``span`` minus every range in ``holes`` (sorted by start)."""
+    pieces = []
+    cursor, end = span
+    for hole_start, hole_end in holes:
+        if hole_end <= cursor or hole_start >= end:
+            continue
+        if hole_start > cursor:
+            pieces.append((cursor, hole_start))
+        cursor = max(cursor, hole_end)
+    if cursor < end:
+        pieces.append((cursor, end))
+    return pieces
 
 
-def find_sections_by_heading(text: str) -> dict[str, Section]:
+def find_sections_by_heading(text: str, *, end: int | None = None) -> dict[str, Section]:
     """Locate item sections by their headings -- the three filters above.
 
     Each section runs from the end of its heading to the start of the next
-    located heading, or to the end of the document for the last one.
+    located heading, or to ``end`` (default: the end of the text) for the last.
+    ``end`` keeps a 10-K's last heading from running on into an exhibit.
     """
-    chosen = longest_monotonic(drop_toc_runs(find_candidates(text)))
+    stop = len(text) if end is None else end
+    chosen = longest_monotonic(drop_toc_runs(find_candidates(text[:stop])))
 
     sections: dict[str, Section] = {}
     for position, candidate in enumerate(chosen):
-        end = chosen[position + 1].start if position + 1 < len(chosen) else len(text)
+        end = chosen[position + 1].start if position + 1 < len(chosen) else stop
         sections[candidate.item] = Section(
             item=candidate.item,
             heading_start=candidate.start,

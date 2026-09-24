@@ -5,7 +5,7 @@
 > request. If a number here disagrees with `fc embed` or `fc build-index`, trust
 > the command.
 
-Turns Stage 2's 14,043 chunks into a searchable index — lexically (BM25) and
+Turns Stage 2's chunks (16,370 item-aware, 19,763 fixed-window) into searchable indexes — lexically (BM25) and
 semantically (k-NN) — that can be rebuilt from stored artifacts in seconds.
 
 The property everything here rests on: **the string that gets embedded, the key
@@ -22,9 +22,9 @@ Three artifacts. Two are the source of truth; the third is derived from them.
 
 | Artifact | Where | Size | What it is |
 |---|---|---|---|
-| **Embedding cache** | `data/processed/embeddings/nomic-embed-text@768/part-*.parquet` | 65 MB, 55 parts | `(digest, vector[768])` rows. Durable. Append-only. |
-| **Manifest** | `data/processed/manifests/item_aware__nomic-embed-text@768.parquet` | 15 MB | One row per chunk: metadata, text, and the `digest` of its vector. Durable. Replaced each run. |
-| **Index** | OpenSearch `filings-item_aware` (Docker) | 290 MB | The join of the two above. **Disposable** — rebuilt in ~14s. |
+| **Embedding cache** | `data/processed/embeddings/nomic-embed-text@768/part-*.parquet` | 173 MB, 147 parts | `(digest, vector[768])` rows. Durable. Append-only. |
+| **Manifests** | `data/processed/manifests/<chunker>__nomic-embed-text@768.parquet` | 18 + 20 MB | One row per chunk: metadata, text, and the `digest` of its vector. Durable. Replaced each run. |
+| **Indexes** | OpenSearch `filings-item_aware`, `filings-fixed_window` (Docker) | 339 + 436 MB | The join of the two above. **Disposable** — each rebuilt in ~20s. |
 
 The index is what Stage 4 queries. The cache and manifest are what you keep:
 lose the index and `fc build-index` recreates it without touching Ollama or SEC.
@@ -36,7 +36,7 @@ lose the index and `fc build-index` recreates it without touching Ollama or SEC.
 ```text
    Stage 2:  cached HTML → normalize → find_sections → item_aware
                                                           │
-                                        14,043 Chunk(text, offsets, item …)
+                                        16,370 Chunk(text, offsets, items …)
                                                           │
 ╔═════════════════════════════════ fc embed ═════════════▼═══════════════════════╗
 ║                                                                                ║
@@ -59,7 +59,7 @@ lose the index and `fc build-index` recreates it without touching Ollama or SEC.
 ║                                   │                                            ║
 ║   write_manifest ◄────────────────┘                                            ║
 ╚═══════════════════════════════════╤════════════════════════════════════════════╝
-                                    ▼   14,043 vectors · 917s cold · 0s warm
+                                    ▼   36,132 vectors (both chunkers) · 0s warm
 ╔══════════════════════════════ fc build-index ══════════════════════════════════╗
 ║                                                                                ║
 ║   read_manifest  +  cache.load(digests)                  index/build.py        ║
@@ -73,7 +73,7 @@ lose the index and `fc build-index` recreates it without touching Ollama or SEC.
 ║                                                          │                     ║
 ║                                   _count ≠ manifest rows ──► ✗ refuse          ║
 ╚═══════════════════════════════════╤════════════════════════════════════════════╝
-                                    ▼   14,043 documents · 12–14s · 0 embeddings
+                                    ▼   16,370 / 19,763 documents · ~20s each · 0 embeddings
                           Stage 4 — hybrid retrieval (RRF)
 ```
 
@@ -93,6 +93,11 @@ asymmetrically — documents as `search_document:`, questions as `search_query:`
 Measured on this Ollama build, `cos(bare, "search_document: " + text) = 0.862`:
 the prefix reaches the model as content, so it is ours to add. That is pinned by a
 live test (`test_ollama_does_not_apply_the_task_prefix_for_us`), not assumed.
+
+A chunk claimed by two items names both, in 10-K order: `… · Item 7. Management's
+Discussion and Analysis; Item 7A. Quantitative and Qualitative Disclosures About
+Market Risk`. The single-item format is unchanged, which is why most cached
+vectors survived the switch to multi-item labels.
 
 **The contextual prefix** is Anthropic's contextual-retrieval idea at zero cost:
 the chunk carries its own company, form, period and item into the vector, and the
@@ -158,12 +163,23 @@ re-embedding one filing never rewrites 65 MB of unrelated vectors.
 
 ```
 ManifestRow(chunk_id, cik, ticker, accession, form, period_end, fiscal_year,
-            item, section_path, char_start, char_end, text, digest, model)
+            items, section_path, document, char_start, char_end,
+            text, text_sha256, digest, model)
 ```
 
 **The text is stored, not re-derived.** Re-deriving at build time would re-run
 `normalize` and the chunkers, and any change to either would put text in the index
 beside a vector computed from different text. Storing it freezes the pair.
+
+Two columns exist for provenance. `document` names the source file — after
+Stage 2 began fetching Annual Report exhibits, one accession can hold two, and a
+citation needs the right URL. `text_sha256` is the hash of the full normalized
+filing that `char_start`/`char_end` index; Stage 4's gold labels record it too, so
+a normalization change is detected as drift instead of silently mis-scoring.
+
+`items` is a list. Text a filer declares for two items (Citigroup's pages 64–120,
+under both Item 7 and 7A) is one chunk carrying both, and OpenSearch's `keyword`
+field holds the array natively: a `term` filter on either item matches it.
 
 It is **replaced, not appended**: a chunk that no longer exists must vanish from
 the next rebuild. Duplicate `chunk_id`s are refused on write — `chunk_id` becomes
@@ -181,7 +197,7 @@ it maps cleanly to an OpenSearch `date` and range filters work.
    ├── text           text, english analyzer  ──► BM25       lexical half
    ├── embedding      knn_vector[768]         ──► HNSW       semantic half
    │                   faiss · innerproduct · m=16 · ef_construction=128
-   ├── filters        keyword: cik ticker form item accession section_path chunk_id
+   ├── filters        keyword: cik ticker form items[] accession section_path document chunk_id
    │                  date: period_end        integer: fiscal_year
    └── stored only    char_start char_end digest model   (index: false)
 
@@ -301,9 +317,9 @@ Configuration (`config.py`, overridable in `.env`): `OLLAMA_HOST`,
 ## Where things live
 
 ```
-data/processed/embeddings/nomic-embed-text@768/part-NNNNN.parquet    65 MB   (digest, vector)
-data/processed/manifests/<chunker>__<model>@<dims>.parquet            15 MB   one row per chunk
-OpenSearch: <prefix>-<chunker>                                       290 MB   derived; disposable
+data/processed/embeddings/nomic-embed-text@768/part-NNNNN.parquet   173 MB   (digest, vector), both chunkers
+data/processed/manifests/<chunker>__<model>@<dims>.parquet         18+20 MB   one row per chunk
+OpenSearch: <prefix>-<chunker>                                   339+436 MB   derived; disposable
 ```
 
 ---
@@ -347,9 +363,10 @@ fc build-index                      # drop + recreate filings-item_aware from th
 | `fc build-index` | `--chunker item_aware\|fixed_window` | Checks model, vectors and norms, then drops and recreates `<prefix>-<chunker>`, bulk-loads, and verifies the count. Stops before touching the old index if anything is missing. | OpenSearch; a manifest |
 | `fc sections` | `--chunker`, `--years`, `--threshold` | Stage 2's coverage report — the same text `fc embed` chunks. | filings cached |
 
-For the ADR-0002 A/B, repeat both with `--chunker fixed_window`. It uses the same
-cache directory but shares no vectors with `item_aware` — its prefix says "full
-document" rather than an item — so expect another ~15 minutes of embedding.
+For the ADR-0002 A/B, repeat both with `--chunker fixed_window`. Both chunkers
+share one cache directory but no vectors — fixed_window's prefix says "full
+document" rather than an item — so its first embed is a cold run (about 26
+minutes for 19,762 chunks on this machine).
 
 ### Looking inside the index
 
@@ -359,7 +376,7 @@ curl 'localhost:9200/filings-item_aware/_count'                # should equal th
 curl 'localhost:9200/filings-item_aware/_mapping?pretty'       # the fields and their types
 
 curl -s localhost:9200/filings-item_aware/_search -H 'Content-Type: application/json' -d '{
-  "size": 3, "_source": ["ticker", "fiscal_year", "item"],
+  "size": 3, "_source": ["ticker", "fiscal_year", "items"],
   "query": { "match": { "text": "allowance for credit losses" } } }'
 ```
 
@@ -406,16 +423,30 @@ from raw HTML to search hits, calling these same functions cell by cell.
 ## Where it stands
 
 ```
-fc embed         cold: 14,043 embedded in 917s     warm: 0 embedded in 0s
-cache            14,043 vectors · 55 parts · 65.2 MiB
-manifest         14,043 rows · 15 MB
-fc build-index   14,043 documents verified by _count in 12–14s
-                 run with OLLAMA_HOST pointed at a dead port — 0 embeddings
-tests            346 offline + 3 live (Ollama ×2, OpenSearch ×1)
+                 item_aware                     fixed_window
+chunks           16,370 (1,205 carry 2 items)   19,763
+fc embed         3,417 new in 232s,             19,762 new in 1,556s (cold)
+                 12,953 served from cache
+second run       0 embedded                     0 embedded
+fc build-index   16,370 verified, 19.7s         19,763 verified, 23.4s
+                 both with OLLAMA_HOST pointed at a dead port -- 0 embeddings
+cache            37,222 vectors · 147 parts · 172.9 MiB (both chunkers, one namespace)
+tests            384 offline + 3 live (Ollama x2, OpenSearch x1)
 ```
 
 **Done when** (`PROJECT_PLAN.txt:340`): *a full rebuild from manifest runs in
-minutes with zero re-embedding* — met, in seconds.
+minutes with zero re-embedding* — met, in seconds, for both chunkers.
+
+**The cache earned its keep on a real change.** The 2026-09-23 sectioning repair
+(WFC/USB exhibits, Citigroup's table, JPMorgan's referrals, multi-item labels)
+rewrote chunk boundaries across a quarter of the corpus. Only the 3,417 chunks
+whose *text or prefix* changed were embedded; the other 12,953 matched their old
+digests, because the key is the content sent to the model — not the chunk id,
+not the offset.
+
+**Multi-item filters work as intended.** Citigroup FY2025: a `term` filter on
+`items: "7"` matches 103 chunks, on `"7A"` 151, and 74 match both — the pages
+Citi declares for both items, found by either filter.
 
 Spot checks against the live index:
 
@@ -423,7 +454,7 @@ Spot checks against the live index:
 |---|---|---|
 | "allowance for credit losses" | BM25 | JPM FY2025 Item 15 — Note 13, *Allowance for credit losses* |
 | "credit card net charge-off risk" | k-NN | CFG FY2025 Item 7 (cos 0.748); COF Items 7 and 1A follow |
-| same, `ticker = SYF` | k-NN + filter | SYF FY2023 Item 1A |
+| same, `ticker = SYF` | k-NN + filter | SYF FY2023 Item 1A — identical to the notebook's by-hand ranking |
 
 These are sanity checks, not an evaluation. Whether retrieval is *good* is a
 Stage 4 question with gold labels.
@@ -432,31 +463,25 @@ Stage 4 question with gold labels.
 
 ## Known gaps
 
-- **The normalized full text is not persisted, nor its hash.** Stage 2 asked for
-  both, so a normalization change would be *detectable*. The manifest stores each
-  chunk's own text, which covers citation quoting, and a normalization change does
-  change digests (so vectors never go stale). But nothing yet records *which*
-  normalized string a chunk's offsets index into. Adding a `text_sha256` per filing
-  to the manifest is the small fix.
-- **Stage 2's shortfalls are in the index.** WFC and USB's six filings were
-  chunked from SEC's wrapper document, not the real 10-K; JPM and Citigroup are
-  partially sectioned. Their chunks are embedded and searchable as they are.
-- **Overlapping sections are indexed twice.** In SYF FY2025, Item 3
-  (chars 528,513–531,695) sits inside Item 8 (419,132–531,695), both from the
-  filer's cross-reference table. `item_aware` chunks each section independently,
-  so that text is embedded and searchable under two item labels. Different
-  contextual prefixes mean different digests, so the cache does not deduplicate
-  it. A Stage 2 fix (clip or reject nested cross-reference spans), found via the
-  walkthrough notebook.
+Resolved on 2026-09-23 (Phase 0 of Stage 4): text hash in the manifest,
+WFC/USB/JPM/Citigroup sectioning, overlapping sections indexed twice, and
+`fixed_window` not embedded. See `docs/stage2_filing_text.md` for the sectioning
+side. What remains:
+
+- **The cache has no garbage collection.** It is append-only by design, so the
+  1,090 vectors whose chunks no longer exist (superseded by the sectioning repair)
+  are still on disk — 37,222 stored against 36,132 referenced. Harmless: nothing
+  reads a digest no manifest names. A `fc cache prune` that keeps only digests
+  referenced by some manifest is the fix, when disk says so.
 - **The index stores each vector twice** — in the HNSW graph and in `_source`.
-  Excluding `embedding` from `_source` would roughly halve the 290 MB. Not done:
-  it also hides the vector from inspection, and disk is not yet tight here.
+  Excluding `embedding` from `_source` would roughly halve the index. Not done:
+  it also hides the vector from inspection, and disk is not yet tight.
 - **768 dimensions only.** Matryoshka truncation to 256 is implemented but
-  unmeasured; whether this Ollama build is v1.5 is unverified. Stage 4's A/B
-  decides, and the model namespace in every key makes switching safe.
-- **`fixed_window` is not embedded yet.** Needed for the ADR-0002 A/B in Stage 4;
-  another ~15 minutes. Its prefix says "full document" rather than an item, so no
-  digests overlap with `item_aware` and nothing is reused.
+  unmeasured. It is an arm of the Stage 4 A/B, and needs no re-embedding —
+  truncation works on the cached vectors.
+- **RF FY2023** is the one filing still partial: its Item 9A is genuine
+  980-character content under the 1,000-character plausibility floor, and its
+  Item 7A names a section without quotes or pages. Its chunks are indexed.
 
 ---
 

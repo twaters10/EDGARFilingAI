@@ -47,8 +47,12 @@ class ManifestRow:
     form: str
     period_end: date
     fiscal_year: int
-    item: str
+    items: tuple[str, ...]
+    """Every item that claims this text -- usually one, two where the filer
+    declares the same pages for both. Empty for ``fixed_window``."""
     section_path: str
+    document: str
+    """The source file within the filing: the 10-K, or its Annual Report."""
     char_start: int
     char_end: int
     text: str
@@ -58,6 +62,10 @@ class ManifestRow:
     Indexing it for BM25 would make every chunk of a filing match its company
     name, which is what the ``ticker`` filter is for.
     """
+    text_sha256: str
+    """Hash of the filing's full normalized text, which ``char_start`` and
+    ``char_end`` index into. If normalization ever changes, offsets move; this is
+    what detects it before a citation or gold label silently points elsewhere."""
     digest: str
     """Key of this chunk's vector in the embedding cache."""
     model: str
@@ -75,11 +83,13 @@ SCHEMA = pa.schema(
         ("form", pa.string()),
         ("period_end", pa.date32()),
         ("fiscal_year", pa.int32()),
-        ("item", pa.string()),
+        ("items", pa.list_(pa.string())),
         ("section_path", pa.string()),
+        ("document", pa.string()),
         ("char_start", pa.int64()),
         ("char_end", pa.int64()),
         ("text", pa.string()),
+        ("text_sha256", pa.string()),
         ("digest", pa.string()),
         ("model", pa.string()),
     ]
@@ -115,4 +125,7 @@ def write_manifest(rows: Sequence[ManifestRow], path: Path) -> None:
 def read_manifest(path: Path) -> list[ManifestRow]:
     """Every row of the manifest at ``path``."""
     table = pq.read_table(path, schema=SCHEMA)
-    return [ManifestRow(**record) for record in table.to_pylist()]
+    # Parquet hands lists back as Python lists; the row type holds a tuple.
+    return [
+        ManifestRow(**{**record, "items": tuple(record["items"])}) for record in table.to_pylist()
+    ]

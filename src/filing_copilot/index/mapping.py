@@ -70,13 +70,17 @@ def index_body(model: EmbeddingModel) -> dict[str, Any]:
                 "ticker": {"type": "keyword"},
                 "accession": {"type": "keyword"},
                 "form": {"type": "keyword"},
-                "item": {"type": "keyword"},
+                # An array: a chunk Citigroup declares for Items 7 and 7A is
+                # stored once with both, and a term filter matches either.
+                "items": {"type": "keyword"},
                 "section_path": {"type": "keyword"},
+                "document": {"type": "keyword"},
                 "period_end": {"type": "date", "format": "strict_date"},
                 "fiscal_year": {"type": "integer"},
                 # --- citation only: stored, never searched ------------------
                 "char_start": {"type": "integer", "index": False},
                 "char_end": {"type": "integer", "index": False},
+                "text_sha256": {"type": "keyword", "index": False},
                 "digest": {"type": "keyword", "index": False},
                 "model": {"type": "keyword", "index": False},
             },

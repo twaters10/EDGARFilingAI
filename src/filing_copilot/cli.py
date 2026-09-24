@@ -31,11 +31,10 @@ from .filings import (
     FilingCoverage,
     FilingDocument,
     FilingText,
+    build_filing_text,
     build_report,
     download_corpus,
-    find_sections,
     load_filing_texts,
-    normalize,
     verify_offsets,
 )
 from .filings.download import MAX_HISTORY_PAGES, CompanyDownload, download_company
@@ -661,8 +660,8 @@ def show(
             raise typer.Exit(code=1) from exc
 
     document = _pick_filing(downloaded.documents, company.ticker, fy)
-    text = normalize(document.path.read_bytes())
-    sections = find_sections(text)
+    filing = build_filing_text(document, company.name)
+    text, sections = filing.text, filing.sections
 
     located = sections.get(item)
     if located is None:
@@ -683,10 +682,14 @@ def show(
         f"chars {located.char_start:,}-{located.char_end:,} "
         f"({located.length:,} long) of {len(text):,} · {document.ref.accession}"
     )
+    typer.echo(f"document: {filing.document_at(located.char_start)}")
     for extra_start, extra_end in located.extra_spans:
         # Only a crossref section has these, and they are the least obvious thing
         # about its output -- a filer declaring "8 - 24, 80 - 85" gets two blocks.
-        typer.echo(f"  also declared: chars {extra_start:,}-{extra_end:,}")
+        typer.echo(
+            f"  also: chars {extra_start:,}-{extra_end:,} "
+            f"({extra_end - extra_start:,} long, {filing.document_at(extra_start)})"
+        )
 
     if offsets:
         return

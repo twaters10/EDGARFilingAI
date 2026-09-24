@@ -34,7 +34,9 @@ def test_text_is_analysed_for_bm25() -> None:
     assert PROPERTIES["text"] == {"type": "text", "analyzer": "english"}
 
 
-@pytest.mark.parametrize("name", ["cik", "ticker", "form", "item", "accession", "chunk_id"])
+@pytest.mark.parametrize(
+    "name", ["cik", "ticker", "form", "items", "accession", "chunk_id", "document"]
+)
 def test_filter_fields_are_keywords(name: str) -> None:
     """An analysed cik would match "0001601712" against "1601712" -- or not at all."""
     assert PROPERTIES[name]["type"] == "keyword"

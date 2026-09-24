@@ -7,6 +7,10 @@ a page footer is a line holding only a number, and it sits at the *end* of its
 page.
 """
 
+# Fixtures reproduce the en dashes filers actually write in page ranges and
+# heading paths; the parser must read them, so they stay.
+# ruff: noqa: RUF001
+
 from __future__ import annotations
 
 from filing_copilot.filings.crossref import (
@@ -155,3 +159,100 @@ def test_a_headed_filing_never_reaches_the_fallback() -> None:
     )
     sections = find_sections(headed + "\n\n" + CROSSREF_TABLE + "\n\n" + long_document(1, 60))
     assert {s.strategy for s in sections.values()} == {"item_heading"}
+
+
+# --- the page index, against the layouts real filers use ----------------------
+
+
+def test_stray_numbers_between_footers_do_not_break_the_run() -> None:
+    """JPMorgan: one table value between pages 86 and 87 used to cut the run in two,
+    leaving an index that started at page 204 and failed every earlier reference."""
+    pages = {n: f"Body text for page {n}." for n in range(1, 61)}
+    pages[30] += "\n\n7\n\n12"  # standalone numbers inside page 30's text
+    assert set(page_index(paginated(pages))) == set(range(1, 61))
+
+
+def test_running_title_footers_are_recognized() -> None:
+    """U.S. Bancorp: even pages end '136 U.S. Bancorp 2025 Annual Report'."""
+    title = "U.S. Bancorp 2025 Annual Report"
+    text = "\n\n".join(
+        f"Body text for page {n}.\n\n" + (f"{n} {title}" if n % 2 == 0 else f"{n}")
+        for n in range(1, 41)
+    )
+    pages = page_index(text)
+    assert set(pages) == set(range(1, 41))
+    # The whole footer line is the mark, so the next page does not begin with the title.
+    start, end = pages[2]
+    assert text[start:end] == f"2 {title}"
+
+
+def test_a_rare_number_and_text_line_is_not_a_running_title() -> None:
+    """'2025 compared with 2024' is prose, not a footer, unless it repeats on every page."""
+    text = long_document(1, 40) + "\n\n41 compared with 2024\n"
+    assert max(page_index(text)) == 40
+
+
+# --- Citigroup's table: bare item numbers, wrapped ranges ----------------------
+
+CITI_TABLE = """FORM 10-K CROSS-REFERENCE INDEX
+
+Item Number
+Page
+
+1.
+
+Business
+4–36, 121–127,
+
+129, 160–164
+
+1A.
+
+Risk Factors
+49–62
+
+1B.
+
+Unresolved Staff Comments
+Not Applicable
+
+7.
+
+Management's Discussion and Analysis
+8–36, 64–120
+
+7A.
+
+Quantitative and Qualitative Disclosures About Market Risk
+64–120, 165–169
+"""
+
+
+def test_bare_item_numbers_are_read_under_a_cross_reference_header() -> None:
+    references = parse_page_references(CITI_TABLE)
+    assert references["1A"] == (PageSpan(49, 62),)
+    assert "1B" not in references
+
+
+def test_a_range_list_wrapped_across_lines_is_rejoined() -> None:
+    assert parse_page_references(CITI_TABLE)["1"] == (
+        PageSpan(4, 36),
+        PageSpan(121, 127),
+        PageSpan(129, 129),
+        PageSpan(160, 164),
+    )
+
+
+def test_bare_numbers_are_ignored_without_the_header() -> None:
+    """Outside a cross-reference index, '1.' is a numbered list, not Item 1."""
+    headerless = CITI_TABLE.replace("FORM 10-K CROSS-REFERENCE INDEX", "").replace(
+        "Item Number", ""
+    )
+    assert parse_page_references(headerless) == {}
+
+
+def test_items_may_declare_the_same_pages() -> None:
+    """Citigroup declares 64-120 for Item 7 and 7A. Both keep it -- see the chunker."""
+    references = parse_page_references(CITI_TABLE)
+    assert PageSpan(64, 120) in references["7"]
+    assert PageSpan(64, 120) in references["7A"]

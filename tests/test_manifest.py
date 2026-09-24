@@ -25,11 +25,13 @@ def row(chunk_id: str = "0001601712-26-000006:1A:0", **overrides: object) -> Man
         "form": "10-K",
         "period_end": date(2025, 12, 31),
         "fiscal_year": 2025,
-        "item": "1A",
+        "items": ("1A",),
         "section_path": "10-K > Item 1A. Risk Factors",
+        "document": "syf-20251231.htm",
         "char_start": 0,
         "char_end": 42,
         "text": "We face substantial credit risk · in our portfolio.",
+        "text_sha256": "cd" * 32,
         "digest": "ab" * 32,
         "model": "nomic-embed-text@768",
     }
@@ -38,7 +40,10 @@ def row(chunk_id: str = "0001601712-26-000006:1A:0", **overrides: object) -> Man
 
 
 def test_rows_round_trip_exactly(tmp_path: Path) -> None:
-    rows = [row(), row("0001601712-26-000006:7:0", item="7", char_start=42, char_end=90)]
+    rows = [
+        row(),
+        row("0001601712-26-000006:42", items=("7", "7A"), char_start=42, char_end=90),
+    ]
     path = tmp_path / "m.parquet"
     write_manifest(rows, path)
     assert read_manifest(path) == rows

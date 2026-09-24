@@ -8,10 +8,7 @@ reports 92% and hides which eight percent failed is worse than one that reports
 So every filing lands in exactly one of three states and none of them is silent:
 
 * **located** -- all three core items found, with plausible lengths.
-* **partial** -- sectioned, but missing at least one core item. Capital One is
-  permanently here: its 10-K carries no line-anchored ``Item 8`` heading, only
-  mid-sentence cross-references to one, and inventing that span is not on the
-  table.
+* **partial** -- sectioned, but missing at least one core item.
 * **failed** -- no sections at all, by either strategy.
 
 :attr:`FilingCoverage.strategy` is reported alongside, because a filing
@@ -26,11 +23,11 @@ it should be visible as such.
 
 from __future__ import annotations
 
-import re
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 
 from .chunkers import FilingText
+from .referrals import INCORPORATION
 from .sections import TARGET_ITEMS, Section
 
 # The three items Stage 2's acceptance criterion is written against.
@@ -39,26 +36,6 @@ CORE_ITEMS: tuple[str, ...] = ("1A", "7", "9A")
 # Below this a "section" is a stray match, not a section. The shortest real
 # Item 9A in the corpus runs about 4,000 characters.
 MIN_PLAUSIBLE_CHARS = 1_000
-
-# The phrases a filer uses when an item's content lives somewhere else:
-#
-#     Item 1A. Risk Factors
-#     Information in response to this Item 1A can be found in the ...
-#
-# Detecting this does not recover the content. It distinguishes a *filing we
-# understand and cannot follow* from a *parser that broke*, and those two need
-# opposite responses -- the first is scope, the second is a bug.
-#
-# The page-citation form ("appears on pages 46-160") is JPMorgan's, and it is
-# the one that looks most tractable and is not: those page numbers belong to the
-# bundled Annual Report's own pagination, not the 10-K wrapper's, which is
-# exactly why :func:`crossref.find_sections_by_page` refuses that filing.
-_INCORPORATION = re.compile(
-    r"(?:information (?:in response to|required by)|refer to|incorporated (?:herein )?by "
-    r"reference|is (?:included|contained|set forth) (?:in|under)"
-    r"|appears? (?:on|in) (?:pages?|the section))",
-    re.IGNORECASE,
-)
 
 # How much of a stub section to inspect for a referring phrase.
 _STUB_WINDOW = 400
@@ -76,12 +53,11 @@ class FilingCoverage:
     strategy: str
     sections: dict[str, Section]
     incorporated: tuple[str, ...] = ()
-    """Items whose section is a stub pointing elsewhere in the filing.
+    """Items whose section is still a stub pointing elsewhere.
 
-    JPMorgan's and U.S. Bancorp's 10-Ks are built this way: every item heading
-    is present and correct, and most carry one sentence of referral instead of
-    content. Following those referrals is not Stage 2 scope, so they are named
-    here rather than quietly counted as located.
+    :mod:`.referrals` follows most of these (JPMorgan, U.S. Bancorp, Wells
+    Fargo). Any left here are referrals it could not resolve -- named, not
+    quietly counted as located.
     """
 
     @property
@@ -171,7 +147,7 @@ def incorporated_items(doc: FilingText) -> tuple[str, ...]:
         section = doc.sections.get(item)
         if section is None or section.length >= MIN_PLAUSIBLE_CHARS:
             continue
-        if _INCORPORATION.search(doc.text[section.char_start : section.char_start + _STUB_WINDOW]):
+        if INCORPORATION.search(doc.text[section.char_start : section.char_start + _STUB_WINDOW]):
             found.append(item)
     return tuple(found)
 
@@ -213,7 +189,7 @@ def verify_offsets(doc: FilingText) -> list[str]:
     """
     problems: list[str] = []
     for item, section in sorted(doc.sections.items()):
-        for start, end in ((section.char_start, section.char_end), *section.extra_spans):
+        for start, end in section.spans:
             if not 0 <= start < end <= len(doc.text):
                 problems.append(
                     f"{doc.ticker} FY{doc.ref.fiscal_year} Item {item}: "

@@ -36,7 +36,7 @@ DEFAULT_BATCH_SIZE = 256
 
 def document_input(doc: FilingText, chunk: Chunk) -> str:
     """What a chunk is embedded as, before the encoder adds the task prefix."""
-    return embedding_input(contextual_prefix(doc, chunk.item), chunk.text)
+    return embedding_input(contextual_prefix(doc, chunk.items), chunk.text)
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +57,7 @@ def plan_corpus(
     rows: list[ManifestRow] = []
     inputs: dict[str, str] = {}
     for doc in docs:
+        text_sha256 = doc.text_sha256  # once per filing, not per chunk
         for chunk in chunker(doc):
             body = document_input(doc, chunk)
             key = digest(model, SEARCH_DOCUMENT, body)
@@ -74,11 +75,13 @@ def plan_corpus(
                     form=chunk.form,
                     period_end=chunk.period_end,
                     fiscal_year=doc.ref.fiscal_year,
-                    item=chunk.item,
+                    items=chunk.items,
                     section_path=chunk.section_path,
+                    document=chunk.document,
                     char_start=chunk.char_start,
                     char_end=chunk.char_end,
                     text=chunk.text,
+                    text_sha256=text_sha256,
                     digest=key,
                     model=model.cache_key,
                 )

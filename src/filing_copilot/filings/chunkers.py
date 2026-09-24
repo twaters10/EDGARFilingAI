@@ -3,7 +3,8 @@
 ``fixed_window`` is the baseline nobody should ship and everybody builds first:
 slide a window over the whole document and ignore its structure. ``item_aware``
 respects the sections :mod:`.sections` located and never lets a chunk straddle
-an item boundary. Both emit the same :class:`Chunk`, which is what makes the
+an item boundary; text that two items both claim is chunked once and carries
+both labels. Both emit the same :class:`Chunk`, which is what makes the
 comparison in Stage 4 a measurement rather than an argument.
 
 Keeping the baseline is deliberate. "Item-aware chunking is better" is a claim;
@@ -25,13 +26,15 @@ nothing while adding a dependency that Stage 3 replaces anyway.
 
 from __future__ import annotations
 
+import hashlib
 import re
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import date
+from itertools import pairwise
 
 from .index import FilingRef
-from .sections import ITEM_HEADING, Section
+from .sections import CROSSREF, ITEM_HEADING, REFERRAL, Section, item_rank
 
 # PROJECT_PLAN's starting point. Both are tunable in Stage 4 against retrieval
 # scores rather than by eye.
@@ -80,19 +83,57 @@ def target_chars(target_tokens: int = TARGET_TOKENS) -> int:
 
 
 @dataclass(frozen=True, slots=True)
+class DocumentPart:
+    """Where one source document sits inside a filing's normalized text."""
+
+    name: str
+    start: int
+    end: int
+
+
+@dataclass(frozen=True, slots=True)
 class FilingText:
-    """A normalized filing plus everything needed to attribute a chunk to it."""
+    """A normalized filing plus everything needed to attribute a chunk to it.
+
+    ``text`` may join more than one document -- a 10-K and the Annual Report it
+    incorporates -- and ``documents`` records where each one sits. It is still
+    one string, so every offset in the system indexes exactly one thing.
+    """
 
     ref: FilingRef
     ticker: str
     company_name: str
     text: str
     sections: dict[str, Section]
+    documents: tuple[DocumentPart, ...] = ()
+
+    @property
+    def parts(self) -> tuple[DocumentPart, ...]:
+        """The source documents; a single-document filing is one part."""
+        return self.documents or (DocumentPart(self.ref.primary_document, 0, len(self.text)),)
+
+    def document_at(self, offset: int) -> str:
+        """Name of the source document holding character ``offset``."""
+        return next((p.name for p in self.parts if p.start <= offset < p.end), self.parts[0].name)
+
+    @property
+    def text_sha256(self) -> str:
+        """Hash of the normalized text every offset indexes into.
+
+        Stored beside each chunk so that a change to normalization -- which
+        shifts offsets -- is detectable rather than silently misaligning
+        citations and gold labels.
+        """
+        return hashlib.sha256(self.text.encode("utf-8")).hexdigest()
 
     @property
     def strategy(self) -> str:
         """How this filing's sections were located; ``item_heading`` if none were."""
-        return next((s.strategy for s in self.sections.values()), ITEM_HEADING)
+        found = {s.strategy for s in self.sections.values()}
+        for strategy in (CROSSREF, REFERRAL):
+            if strategy in found:
+                return strategy
+        return ITEM_HEADING
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,9 +145,17 @@ class Chunk:
     accession: str
     form: str
     period_end: date
-    item: str
-    """The item this text came from, or ``""`` for the structure-blind baseline."""
+    items: tuple[str, ...]
+    """Every item that claims this text, in 10-K order; empty for the
+    structure-blind baseline.
+
+    Usually one. Two when the filer declares the same pages for both -- Citigroup
+    lists pages 64-120 under Item 7 *and* Item 7A -- and a filter on either item
+    must find them.
+    """
     section_path: str
+    document: str
+    """The source file this text came from -- the 10-K, or its Annual Report."""
     char_start: int
     char_end: int
     text: str
@@ -116,13 +165,47 @@ class Chunk:
         return estimate_tokens(self.text)
 
 
+@dataclass(frozen=True, slots=True)
+class Segment:
+    """A run of text claimed by the same set of items."""
+
+    start: int
+    end: int
+    items: tuple[str, ...]
+
+
+def labelled_segments(sections: dict[str, Section]) -> list[Segment]:
+    """Cut the filing at every section boundary; label each piece with its items.
+
+    This is what makes overlapping declarations safe. Each character is chunked
+    once, inside exactly one segment, and the segment carries every item whose
+    spans cover it. Text claimed by no item is not a segment.
+    """
+    bounds = sorted({point for s in sections.values() for span in s.spans for point in span})
+    segments: list[Segment] = []
+    for start, end in pairwise(bounds):
+        claimed = {
+            item
+            for item, section in sections.items()
+            if any(lo <= start and end <= hi for lo, hi in section.spans)
+        }
+        if not claimed:
+            continue
+        items = tuple(sorted(claimed, key=item_rank))
+        if segments and segments[-1].end == start and segments[-1].items == items:
+            segments[-1] = Segment(segments[-1].start, end, items)
+        else:
+            segments.append(Segment(start, end, items))
+    return segments
+
+
 def item_label(item: str) -> str:
     """``"1A"`` -> ``"Item 1A. Risk Factors"``."""
     title = ITEM_TITLES.get(item)
     return f"Item {item}. {title}" if title else f"Item {item}"
 
 
-def contextual_prefix(doc: FilingText, item: str) -> str:
+def contextual_prefix(doc: FilingText, items: Sequence[str]) -> str:
     """The situating line prepended to a chunk **at embedding time only**.
 
     Anthropic's contextual-retrieval result is that a chunk carrying its own
@@ -132,31 +215,36 @@ def contextual_prefix(doc: FilingText, item: str) -> str:
 
     Stage 3 must send this to the encoder as::
 
-        "search_document: " + contextual_prefix(...) + "\\n\\n" + chunk.text
+        "search_document: " + contextual_prefix(...) + "\n\n" + chunk.text
 
     with nomic's task prefix **outermost**. Getting that order wrong degrades
     retrieval silently -- there is no error, only worse results.
     """
     period = doc.ref.report_date.isoformat()
-    where = item_label(item) if item else "full document"
+    where = "; ".join(item_label(item) for item in items) if items else "full document"
     return f"{doc.company_name} ({doc.ticker}) · {doc.ref.form} · period ending {period} · {where}"
 
 
-def _section_path(doc: FilingText, item: str) -> str:
-    return f"{doc.ref.form} > {item_label(item)}" if item else doc.ref.form
+def _section_path(doc: FilingText, items: Sequence[str]) -> str:
+    if not items:
+        return doc.ref.form
+    return f"{doc.ref.form} > " + "; ".join(item_label(item) for item in items)
 
 
-def _make_chunk(doc: FilingText, item: str, start: int, end: int) -> Chunk:
+def _make_chunk(doc: FilingText, items: tuple[str, ...], start: int, end: int) -> Chunk:
     return Chunk(
-        # Deterministic and readable: the same filing re-chunked the same way
-        # yields the same ids, which is what lets Stage 3 re-index incrementally.
-        chunk_id=f"{doc.ref.accession}:{item or 'doc'}:{start}",
+        # Deterministic, and independent of labelling: each character is
+        # chunked once per chunker, so the start offset alone identifies a
+        # chunk within a filing. Relabelling a span (a better cross-reference
+        # parse) leaves ids -- and any gold labels keyed to them -- unchanged.
+        chunk_id=f"{doc.ref.accession}:{start}",
         cik=doc.ref.cik,
         accession=doc.ref.accession,
         form=doc.ref.form,
         period_end=doc.ref.report_date,
-        item=item,
-        section_path=_section_path(doc, item),
+        items=items,
+        section_path=_section_path(doc, items),
+        document=doc.document_at(start),
         char_start=start,
         char_end=end,
         text=doc.text[start:end],
@@ -218,18 +306,21 @@ def fixed_window(
     target_tokens: int = TARGET_TOKENS,
     overlap: float = OVERLAP_FRACTION,
 ) -> list[Chunk]:
-    """Structure-blind baseline: one sliding window over the whole filing.
+    """Structure-blind baseline: one sliding window over each source document.
 
     Carries no item attribution, because it has none to carry. That is the
-    point of keeping it -- Stage 4 measures what that costs.
+    point of keeping it -- Stage 4 measures what that costs. It does respect
+    document boundaries: a 10-K and its Annual Report are separate files, and a
+    window spanning both would cite neither.
     """
     size = target_chars(target_tokens)
-    spans = _split_span(
-        doc.text, 0, len(doc.text), size=size, overlap_chars=_overlap(size, overlap)
-    )
+    overlap_chars = _overlap(size, overlap)
     return [
-        _make_chunk(doc, "", start, stop)
-        for start, stop in spans
+        _make_chunk(doc, (), start, stop)
+        for part in doc.parts
+        for start, stop in _split_span(
+            doc.text, part.start, part.end, size=size, overlap_chars=overlap_chars
+        )
         if stop - start >= MIN_CHUNK_CHARS
     ]
 
@@ -241,33 +332,32 @@ def item_aware(
     overlap: float = OVERLAP_FRACTION,
     items: Iterable[str] | None = None,
 ) -> list[Chunk]:
-    """Chunk within located sections, never across an item boundary.
+    """Chunk within labelled segments, never across an item boundary.
 
     A chunk that straddles the seam between Risk Factors and MD&A is attributed
     to one of them and is partly about the other, which is exactly the failure
-    that makes a citation wrong while looking right.
+    that makes a citation wrong while looking right. Segments
+    (:func:`labelled_segments`) cut at every boundary, so no chunk crosses one --
+    and text two items both claim is chunked once, labelled with both.
 
     Filings whose sections could not be located produce no chunks here. That is
-    reported by :mod:`.coverage`, not silently swallowed -- and it is why the
-    cross-reference fallback was worth building.
+    reported by :mod:`.coverage`, not silently swallowed.
     """
     size = target_chars(target_tokens)
     overlap_chars = _overlap(size, overlap)
     wanted = set(items) if items is not None else None
 
     chunks: list[Chunk] = []
-    for item, section in sorted(doc.sections.items(), key=lambda kv: kv[1].char_start):
-        if wanted is not None and item not in wanted:
+    for segment in labelled_segments(doc.sections):
+        if wanted is not None and not wanted.intersection(segment.items):
             continue
-        spans = [(section.char_start, section.char_end), *section.extra_spans]
-        for span_start, span_end in spans:
-            chunks.extend(
-                _make_chunk(doc, item, start, stop)
-                for start, stop in _split_span(
-                    doc.text, span_start, span_end, size=size, overlap_chars=overlap_chars
-                )
-                if stop - start >= MIN_CHUNK_CHARS
+        chunks.extend(
+            _make_chunk(doc, segment.items, start, stop)
+            for start, stop in _split_span(
+                doc.text, segment.start, segment.end, size=size, overlap_chars=overlap_chars
             )
+            if stop - start >= MIN_CHUNK_CHARS
+        )
     return chunks
 
 
