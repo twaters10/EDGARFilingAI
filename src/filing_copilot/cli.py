@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import datetime as dt
 import shutil
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import replace
-from typing import Annotated
+from typing import Annotated, NoReturn
 
 import typer
+import yaml
 
 from .config import ConfigError, Settings, get_settings
 from .edgar import EdgarClient, TickerResolver, UnknownTickerError, normalize_cik
@@ -37,10 +40,12 @@ from .filings import (
     load_filing_texts,
     verify_offsets,
 )
+from .filings.chunkers import ITEM_TITLES
 from .filings.download import MAX_HISTORY_PAGES, CompanyDownload, download_company
 from .filings.index import IncompleteFilingIndexError
 from .index import (
     IndexBuildError,
+    ManifestRow,
     OpenSearchClient,
     OpenSearchError,
     build_index,
@@ -49,6 +54,62 @@ from .index import (
     read_manifest,
     write_manifest,
 )
+from .retrieval import (
+    MODES,
+    FanOutResult,
+    Hit,
+    Mode,
+    SearchFilters,
+    bm25_search,
+    cosine_from_knn_score,
+    encode_query,
+    fan_out_peers,
+    hybrid_search,
+    vector_search,
+)
+from .retrieval.adjudicate import (
+    MIN_RECHECK_DAYS,
+    agreement,
+    build_pool,
+    narrow,
+    recent_judgments,
+    recheck_sample,
+    render,
+)
+from .retrieval.evalset import (
+    FAILURES_FILE,
+    JUDGMENTS_FILE,
+    QUESTIONS_FILE,
+    RECHECKS_FILE,
+    CorpusVocabulary,
+    EvalSetError,
+    FailureTag,
+    Judgment,
+    Question,
+    Recheck,
+    append_judgment,
+    append_recheck,
+    check_gold,
+    load_failures,
+    load_judgments,
+    load_questions,
+    load_rechecks,
+)
+from .retrieval.evaluate import (
+    Config,
+    QuestionResult,
+    SearchFn,
+    Strategy,
+    failure_table,
+    grid,
+    live_search_fn,
+    run_eval,
+    summarize,
+    untagged_failures,
+    win_loss,
+    write_csv,
+)
+from .retrieval.labeling import find_passages, gold_entry
 from .structured import (
     AS_REPORTED,
     AS_RESTATED,
@@ -248,14 +309,6 @@ def cache_info() -> None:
     if stats.oldest and stats.newest:
         typer.echo(f"oldest:  {stats.oldest.isoformat()}")
         typer.echo(f"newest:  {stats.newest.isoformat()}")
-
-
-def main() -> None:  # pragma: no cover - thin wrapper
-    sys.exit(app())
-
-
-if __name__ == "__main__":  # pragma: no cover
-    main()
 
 
 @app.command("coverage")
@@ -876,3 +929,579 @@ def build_index_command(chunker: ChunkerOpt = "item_aware") -> None:
         f"{verb} {result.index}: {result.documents:,} documents verified by _count "
         f"in {time.monotonic() - started:,.1f}s -- 0 embeddings computed"
     )
+
+
+# --- Stage 4: retrieval ---------------------------------------------------------
+
+MultiTickerOpt = Annotated[
+    list[str] | None, typer.Option("--ticker", "-t", help="Filter to a ticker. Repeatable.")
+]
+MultiYearOpt = Annotated[
+    list[int] | None, typer.Option("--fy", help="Filter to a fiscal year. Repeatable.")
+]
+MultiItemOpt = Annotated[
+    list[str] | None, typer.Option("--item", "-i", help="Filter to an item, e.g. 1A. Repeatable.")
+]
+
+
+@app.command("search")
+def search(
+    query: Annotated[str, typer.Argument(help="The question, as a user would type it.")],
+    mode: Annotated[
+        str,
+        typer.Option("--mode", help="vector (kNN), bm25 (lexical), or hybrid (the two, by RRF)."),
+    ] = "vector",
+    chunker: ChunkerOpt = "item_aware",
+    k: Annotated[int, typer.Option("-k", help="Results to show per retriever.")] = 10,
+    compare: Annotated[
+        bool, typer.Option("--compare", help="Run all three retrievers and show them together.")
+    ] = False,
+    tickers: MultiTickerOpt = None,
+    fiscal_years: MultiYearOpt = None,
+    items: MultiItemOpt = None,
+    fan_out: Annotated[
+        bool,
+        typer.Option("--fan-out", help="One search per --ticker, interleaved, instead of one."),
+    ] = False,
+    per_company: Annotated[int, typer.Option("-n", help="Hits per company with --fan-out.")] = 3,
+) -> None:
+    """Search one index, and show exactly what each retriever returned.
+
+    Vector scores are shown as cosine similarity (undoing OpenSearch's score
+    transform); BM25 scores are raw; hybrid scores are RRF sums, and each hybrid
+    hit shows where the vector and BM25 lists ranked it. No score is comparable
+    across retrievers -- only ranks are, which is why fusion uses them.
+
+    --ticker/--fy/--item are exact-match filters applied inside each query.
+    --fan-out runs one filtered search per ticker so every company is represented.
+    """
+    settings = _load_settings()
+    _check_chunker(chunker)
+    _check_mode(mode)
+    filters = SearchFilters.of(
+        tickers=tickers or (), fiscal_years=fiscal_years or (), items=items or ()
+    )
+    if fan_out and len(filters.tickers) < 2:
+        _fail("--fan-out needs at least two --ticker values.", code=2)
+    name = index_name(settings.opensearch_index_prefix, chunker)
+    modes: tuple[str, ...] = MODES if compare and not fan_out else (mode,)
+
+    results: dict[str, list[Hit]] = {}
+    fanned: FanOutResult | None = None
+    try:
+        with OpenSearchClient(settings.opensearch_url) as client:
+            vector: list[float] = []
+            encoder = None
+            if set(modes) & {"vector", "hybrid"}:
+                encoder = OllamaEncoder(host=settings.ollama_host, model=_embedding_model(settings))
+                vector = encode_query(encoder, query)  # once, shared by every mode
+            if fan_out:
+                fanned = fan_out_peers(
+                    client,
+                    encoder,
+                    name,
+                    query,
+                    filters.tickers,
+                    n_per_company=per_company,
+                    mode=_as_mode(mode),
+                    filters=filters,
+                )
+                results[mode] = fanned.hits
+            else:
+                if "vector" in modes:
+                    results["vector"] = vector_search(client, name, vector, k=k, filters=filters)
+                if "bm25" in modes:
+                    results["bm25"] = bm25_search(client, name, query, k=k, filters=filters)
+                if "hybrid" in modes:
+                    results["hybrid"] = hybrid_search(
+                        client, name, query, vector, k=k, filters=filters
+                    )
+            if encoder is not None:
+                encoder.close()
+    except (EncoderError, OpenSearchError) as exc:
+        _fail(f"{exc}\nIs the index built? `fc build-index --chunker {chunker}`.", code=1)
+
+    scope = "" if filters.is_empty else f"  filters: {filters.clauses()}"
+    typer.echo(f"{query!r} against {name}{scope}")
+    for retriever, hits in results.items():
+        _print_hits(retriever, hits)
+
+    if fanned is not None:
+        covered = [t for t in filters.tickers if fanned.per_company[t]]
+        typer.echo(f"\ncompanies with hits: {', '.join(covered) or '-'}")
+        if fanned.empty:
+            typer.echo(f"no hits (a finding, not an error): {', '.join(fanned.empty)}")
+    elif compare:
+        ids = {r: {h.chunk_id for h in hits} for r, hits in results.items()}
+        typer.echo(f"\nshared top-{k}:  vector & bm25 {len(ids['vector'] & ids['bm25'])}")
+        for retriever, hits in results.items():
+            found = ", ".join(sorted({h.ticker for h in hits})) or "-"
+            typer.echo(f"{retriever:>6} companies: {found}")
+
+
+def _print_hits(retriever: str, hits: list[Hit], snippet_chars: int = 100) -> None:
+    label = {"vector": "cosine", "bm25": "bm25", "hybrid": "rrf"}[retriever]
+    typer.echo(f"\n-- {retriever} ({len(hits)} hits) " + "-" * 50)
+    if not hits:
+        typer.echo("   (no hits)")
+    for hit in hits:
+        score = cosine_from_knn_score(hit.score) if retriever == "vector" else hit.score
+        hit_items = ",".join(hit.items) or "-"
+        snippet = " ".join(hit.text.split())[:snippet_chars]
+        where = f"{_provenance(hit):<13} " if hit.sources else ""
+        typer.echo(
+            f"{hit.rank:>3}  {label} {score:6.3f}  {where}{hit.ticker:<5} FY{hit.fiscal_year} "
+            f"{hit_items:<8}  {snippet}"
+        )
+
+
+def _provenance(hit: Hit) -> str:
+    """``v#3 b#1`` -- where each fused list ranked this hit; ``-`` where it did not."""
+    ranks = dict(hit.sources)
+    return " ".join(
+        f"{name[0]}#{ranks[name]}" if name in ranks else f"{name[0]}#-"
+        for name in ("vector", "bm25")
+    )
+
+
+def _check_mode(mode: str) -> None:
+    if mode not in MODES:
+        _fail(f"--mode must be one of {', '.join(MODES)}, got {mode!r}.", code=2)
+
+
+def _as_mode(mode: str) -> Mode:
+    for known in MODES:
+        if known == mode:
+            return known
+    raise ValueError(mode)
+
+
+def _fail(message: str, *, code: int) -> NoReturn:
+    typer.secho(message, fg=typer.colors.RED, err=True)
+    raise typer.Exit(code=code)
+
+
+# --- Stage 4: the retrieval eval --------------------------------------------------
+
+
+@app.command("label-span")
+def label_span(
+    ticker: Annotated[str, typer.Option("--ticker", "-t", help="Corpus ticker, e.g. SYF.")],
+    find: Annotated[str, typer.Option("--find", "-f", help="Phrase to look for (any case).")],
+    fy: Annotated[
+        int | None, typer.Option("--fy", help="Fiscal year. Defaults to the most recent.")
+    ] = None,
+    item: Annotated[
+        str | None, typer.Option("--item", "-i", help="Search only this item's text.")
+    ] = None,
+    grade: Annotated[int, typer.Option("--grade", help="Grade to pre-fill (1 or 2).")] = 2,
+    limit: Annotated[int, typer.Option("--max", help="Most passages to show.")] = 10,
+) -> None:
+    """Find passages to label as gold, by reading the filing -- not the retriever.
+
+    Prints every paragraph containing --find, with the exact offsets gold spans
+    need, followed by a ready-to-paste YAML entry for a question's `gold:` list.
+    Check each passage against RUBRIC.md before pasting, and fix the grade.
+    """
+    if grade not in (1, 2):
+        _fail("--grade must be 1 or 2 (a 0 is a judgment, not gold).", code=2)
+    settings = _load_settings()
+    filing = _load_filing(settings, ticker, fy)
+    passages = find_passages(filing, find, item=item, max_results=limit)
+
+    where = f"Item {item.upper()}" if item else "the whole filing"
+    typer.echo(
+        f"{filing.ticker} FY{filing.ref.fiscal_year} · {filing.ref.accession} · "
+        f"{len(passages)} passage(s) containing {find!r} in {where}"
+    )
+    if not passages:
+        if item and item.strip().upper() not in filing.sections:
+            typer.echo(f"Item {item.upper()} was not located in this filing -- see `fc sections`.")
+        return
+
+    for n, passage in enumerate(passages, start=1):
+        typer.echo(
+            f"\n[{n}] chars {passage.char_start:,}-{passage.char_end:,} "
+            f"({passage.char_end - passage.char_start:,} long) · {passage.document}"
+        )
+        typer.echo(passage.text.strip())
+        entry = yaml.safe_dump(
+            [gold_entry(filing, passage, grade=grade)], sort_keys=False, width=1000
+        )
+        typer.secho(
+            "\n".join("      " + line for line in entry.rstrip().splitlines()), fg=typer.colors.CYAN
+        )
+
+
+@app.command("eval-retrieval")
+def eval_retrieval(
+    split: Annotated[str, typer.Option("--split", help="dev (default), blind, or all.")] = "dev",
+    strategy: Annotated[
+        str,
+        typer.Option(
+            "--strategy", help="global (question text only), scoped (scope as filters), or both."
+        ),
+    ] = "global",
+    chunker: Annotated[
+        str | None, typer.Option("--chunker", help="One chunker only. Default: both.")
+    ] = None,
+) -> None:
+    """Score every question under every retriever x chunker, against the labels.
+
+    Prints means per configuration (over labelled questions), per-question
+    win/loss counts, the unjudged rate, and error-analysis to-dos; writes one
+    CSV row per question x configuration under data/processed/eval/.
+    """
+    settings = _load_settings()
+    if split not in ("dev", "blind", "all"):
+        _fail("--split must be dev, blind or all.", code=2)
+    if strategy not in ("global", "scoped", "both"):
+        _fail("--strategy must be global, scoped or both.", code=2)
+    chunkers = [chunker] if chunker else sorted(CHUNKERS)
+    for name in chunkers:
+        _check_chunker(name)
+
+    questions, judgments, _ = _load_eval(settings)
+    chosen = [q for q in questions if split == "all" or q.split == split]
+    if split in ("blind", "all"):
+        _record_blind_run(settings, split)
+
+    strategies: list[Strategy] = (
+        ["global", "scoped"]
+        if strategy == "both"
+        else ["scoped" if strategy == "scoped" else "global"]
+    )
+    configs = [c for s in strategies for c in grid(chunkers, strategy=s)]
+    typer.echo(
+        f"{len(chosen)} {split} question(s), {sum(q.is_labelled for q in chosen)} labelled · "
+        f"{len(judgments)} judgment(s) · {len(configs)} configuration(s)"
+    )
+
+    results = _run_eval_live(settings, chosen, configs, judgments, chunkers)
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    out = settings.eval_runs_dir / f"retrieval-{split}-{strategy}-{stamp}.csv"
+    write_csv(results, out)
+
+    _print_eval_summary(results, configs, chunkers)
+    tags = load_failures(settings.retrieval_evals_dir / FAILURES_FILE)
+    _print_failure_analysis(results, tags, configs)
+    agreed = agreement(
+        questions, judgments, load_rechecks(settings.retrieval_evals_dir / RECHECKS_FILE)
+    )
+    if agreed is not None:
+        typer.echo(
+            f"\nlabel agreement (recheck): {agreed.pairs} pairs · "
+            f"{agreed.percent:.0%} agree · Cohen's kappa {agreed.kappa:.2f}"
+        )
+    typer.echo(f"\nper-question results: {out}")
+
+
+@app.command("adjudicate")
+def adjudicate(
+    question_id: Annotated[
+        str | None, typer.Option("--question", "-q", help="One question only.")
+    ] = None,
+    split: Annotated[str, typer.Option("--split", help="dev (default) or blind.")] = "dev",
+    depth: Annotated[int, typer.Option("--depth", help="Top-k pooled per configuration.")] = 10,
+    recheck: Annotated[
+        bool, typer.Option("--recheck", help="Blindly re-grade a sample of judged spans.")
+    ] = False,
+    fraction: Annotated[
+        float, typer.Option("--fraction", help="Share of judged spans to recheck.")
+    ] = 0.15,
+) -> None:
+    """Judge pooled, unjudged hits -- blind to which system found them.
+
+    Pools every configuration's top --depth for each labelled question, drops
+    anything already judged, deduplicates, shuffles, and asks for a grade per
+    RUBRIC.md. Answers are appended to judgments.yaml as you go; quit any time
+    and re-run to resume.
+
+    With --recheck: re-grade a random sample of already-judged spans without
+    seeing the original grades, and report agreement (Cohen's kappa).
+    """
+    settings = _load_settings()
+    questions, judgments, _ = _load_eval(settings)
+    if recheck:
+        _run_recheck(settings, questions, judgments, fraction)
+        return
+
+    chosen = [q for q in questions if (q.id == question_id if question_id else q.split == split)]
+    if question_id and not chosen:
+        _fail(f"No question {question_id!r} in questions.yaml.", code=2)
+    unlabelled = [q.id for q in chosen if not q.is_labelled]
+    if unlabelled:
+        typer.secho(
+            f"skipping {len(unlabelled)} question(s) with no gold yet: {', '.join(unlabelled)}\n"
+            f"  Label them from the filing first (`fc label-span`) -- adjudicating a question "
+            f"with no gold would build its labels from retrieval output alone.",
+            fg=typer.colors.YELLOW,
+        )
+    chosen = [q for q in chosen if q.is_labelled]
+    if not chosen:
+        return
+
+    configs = grid(sorted(CHUNKERS))
+    path = settings.retrieval_evals_dir / JUDGMENTS_FILE
+    judged = 0
+    with _live_search(settings, sorted(CHUNKERS)) as search_fn:
+        for question in chosen:
+            results = {c: search_fn(question, c, depth) for c in configs}
+            pool = build_pool(question, results, load_judgments(path), depth=depth)
+            if not pool:
+                continue
+            typer.secho(f"\n=== {question.id}: {len(pool)} to judge", bold=True)
+            for n, item in enumerate(pool, start=1):
+                typer.echo(f"\n[{n}/{len(pool)}] " + render(item, question))
+                answer = _ask_grade()
+                if answer == "q":
+                    typer.echo(f"\nstopped. {judged} judgment(s) saved to {path}")
+                    return
+                if answer == "s":
+                    continue
+                start, end = item.char_start, item.char_end
+                if int(answer) > 0:
+                    phrase = typer.prompt(
+                        "  phrase from the answering paragraph (Enter = whole chunk)",
+                        default="",
+                        show_default=False,
+                    )
+                    if phrase and (narrowed := narrow(item, phrase)) is not None:
+                        start, end = narrowed
+                    elif phrase:
+                        typer.echo("  phrase not found -- recording the whole chunk")
+                append_judgment(
+                    path,
+                    Judgment(
+                        question=question.id,
+                        accession=item.accession,
+                        char_start=start,
+                        char_end=end,
+                        grade=int(answer),
+                        judged_on=dt.date.today(),
+                        document=item.document,
+                    ),
+                )
+                judged += 1
+    typer.echo(f"\ndone. {judged} judgment(s) saved to {path}")
+
+
+def _ask_grade() -> str:
+    while True:
+        answer = str(typer.prompt("  grade 0/1/2, s=skip, q=quit")).strip().lower()
+        if answer in ("0", "1", "2", "s", "q"):
+            return answer
+        typer.echo("  0, 1, 2, s or q")
+
+
+def _run_recheck(
+    settings: Settings, questions: list[Question], judgments: list[Judgment], fraction: float
+) -> None:
+    path = settings.retrieval_evals_dir / RECHECKS_FILE
+    fresh = recent_judgments(questions, judgments, dt.date.today())
+    if fresh:
+        typer.secho(
+            f"{fresh} label(s) are under {MIN_RECHECK_DAYS} days old -- a recheck this soon "
+            f"measures memory, not judgment.",
+            fg=typer.colors.YELLOW,
+        )
+        if not typer.confirm("Recheck anyway?", default=False):
+            return
+    sample = recheck_sample(questions, judgments, load_rechecks(path), fraction=fraction)
+    if not sample:
+        typer.echo("Nothing to recheck: no judged spans, or all already rechecked.")
+        return
+
+    by_id = {q.id: q for q in questions}
+    texts = _span_texts(settings, {item.accession for item in sample})
+    typer.echo(f"{len(sample)} span(s) to re-grade. Original grades are not shown.")
+    for n, item in enumerate(sample, start=1):
+        text = texts[item.accession][item.char_start : item.char_end]
+        typer.echo(
+            f"\n[{n}/{len(sample)}] {item.question}: {by_id[item.question].question}\n"
+            f"{'-' * 72}\n{text.strip()}\n{'-' * 72}"
+        )
+        answer = _ask_grade()
+        if answer == "q":
+            break
+        if answer == "s":
+            continue
+        append_recheck(
+            path,
+            Recheck(
+                question=item.question,
+                accession=item.accession,
+                char_start=item.char_start,
+                char_end=item.char_end,
+                regrade=int(answer),
+                rechecked_on=dt.date.today(),
+            ),
+        )
+    agreed = agreement(questions, judgments, load_rechecks(path))
+    if agreed is not None:
+        typer.echo(
+            f"\nagreement over {agreed.pairs} rechecked span(s): {agreed.percent:.0%} · "
+            f"Cohen's kappa {agreed.kappa:.2f}"
+        )
+
+
+def _load_eval(settings: Settings) -> tuple[list[Question], list[Judgment], list[ManifestRow]]:
+    """Questions (validated), judgments, and the manifest the gold is checked against."""
+    model = _embedding_model(settings)
+    path = manifest_path(settings.manifests_dir, "item_aware", model.cache_key)
+    if not path.exists():
+        _fail(f"No manifest at {path}. Run 'fc embed' first.", code=2)
+    manifest = read_manifest(path)
+    try:
+        corpus = Corpus.load(settings.corpus_path)
+        vocabulary = CorpusVocabulary(
+            tickers=frozenset(c.ticker for c in corpus),
+            fiscal_years=frozenset(r.fiscal_year for r in manifest),
+            items=frozenset(ITEM_TITLES),
+        )
+        questions = load_questions(settings.retrieval_evals_dir / QUESTIONS_FILE, vocabulary)
+        judgments = load_judgments(settings.retrieval_evals_dir / JUDGMENTS_FILE)
+    except (CorpusError, EvalSetError) as exc:
+        _fail(str(exc), code=2)
+    if problems := check_gold(questions, manifest):
+        _fail("Gold spans out of step with the index:\n  - " + "\n  - ".join(problems), code=1)
+    return questions, judgments, manifest
+
+
+@contextmanager
+def _live_search(settings: Settings, chunkers: list[str]) -> Iterator[SearchFn]:
+    """OpenSearch and Ollama opened once, as a SearchFn over every chunker's index."""
+    index_for = {c: index_name(settings.opensearch_index_prefix, c) for c in chunkers}
+    with (
+        OpenSearchClient(settings.opensearch_url) as client,
+        OllamaEncoder(host=settings.ollama_host, model=_embedding_model(settings)) as encoder,
+    ):
+        yield live_search_fn(client, encoder, index_for)
+
+
+def _run_eval_live(
+    settings: Settings,
+    questions: list[Question],
+    configs: list[Config],
+    judgments: list[Judgment],
+    chunkers: list[str],
+) -> list[QuestionResult]:
+    try:
+        with _live_search(settings, chunkers) as search_fn:
+            return run_eval(questions, configs, search_fn, judgments)
+    except (EncoderError, OpenSearchError) as exc:
+        _fail(f"{exc}\nIs OpenSearch up and are the indexes built?", code=1)
+
+
+def _print_eval_summary(
+    results: list[QuestionResult], configs: list[Config], chunkers: list[str]
+) -> None:
+    def fmt(value: float | None) -> str:
+        return "   -  " if value is None else f"{value:6.3f}"
+
+    typer.echo(
+        f"\n{'configuration':<30} {'labelled':>8} {'R@5':>6} {'R@10':>6} {'MRR':>6} "
+        f"{'nDCG@10':>7} {'unjudged@10':>11} {'peer cov@10':>11}"
+    )
+    for s in summarize(results):
+        typer.echo(
+            f"{s.config.label:<30} {s.labelled:>4}/{s.questions:<3} {fmt(s.recall_5)} "
+            f"{fmt(s.recall_10)} {fmt(s.mrr)} {fmt(s.ndcg_10):>7} {s.unjudged_10:>11.1f} "
+            f"{fmt(s.peer_coverage_10):>11}"
+        )
+    if not any(r.labelled for r in results):
+        typer.secho(
+            "\nNo labelled questions yet: every metric is '-'. Add gold spans with "
+            "`fc label-span`. (Peer coverage needs no labels.)",
+            fg=typer.colors.YELLOW,
+        )
+        return
+
+    typer.echo("\nper-question nDCG@10, wins-losses-ties:")
+    for strategy in sorted({c.strategy for c in configs}):
+        for name in chunkers:
+            hybrid = Config("hybrid", name, strategy)
+            for other in ("vector", "bm25"):
+                wl = win_loss(results, hybrid, Config(_as_mode(other), name, strategy))
+                typer.echo(f"  {hybrid.label:<30} vs {other:<7} {wl.wins}-{wl.losses}-{wl.ties}")
+        if len(chunkers) == 2:
+            for mode in MODES:
+                a, b = Config(mode, "item_aware", strategy), Config(mode, "fixed_window", strategy)
+                wl = win_loss(results, a, b)
+                typer.echo(f"  {a.label:<30} vs fixed_window {wl.wins}-{wl.losses}-{wl.ties}")
+
+
+def _print_failure_analysis(
+    results: list[QuestionResult], tags: list[FailureTag], configs: list[Config]
+) -> None:
+    table = failure_table(tags)
+    if table:
+        columns = sorted({c for counts in table.values() for c in counts})
+        typer.echo("\nfailure causes (failures.yaml):")
+        typer.echo(f"  {'cause':<24}" + "".join(f"{c:>26}" for c in columns))
+        for cause, counts in table.items():
+            typer.echo(f"  {cause:<24}" + "".join(f"{counts.get(c, 0):>26}" for c in columns))
+    for config in configs:
+        if config.mode != "hybrid":
+            continue
+        todo = untagged_failures(results, tags, config)
+        if todo:
+            typer.echo(f"\nto tag in failures.yaml ({config.label} missed): {', '.join(todo)}")
+
+
+def _record_blind_run(settings: Settings, split: str) -> None:
+    """The blind split is run once. Keep a log, and say so when it is not the first time."""
+    log = settings.eval_runs_dir / "blind_runs.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    previous = log.read_text().splitlines() if log.exists() else []
+    if previous:
+        typer.secho(
+            f"The blind split has been run {len(previous)} time(s) before "
+            f"(last: {previous[-1]}). Its numbers stop being blind once decisions follow them.",
+            fg=typer.colors.YELLOW,
+        )
+    with log.open("a") as handle:
+        handle.write(f"{dt.datetime.now().isoformat(timespec='seconds')} split={split}\n")
+
+
+def _load_filing(settings: Settings, ticker: str, fy: int | None) -> FilingText:
+    try:
+        company = Corpus.load(settings.corpus_path).by_ticker(ticker)
+    except CorpusError as exc:
+        _fail(str(exc), code=2)
+    with EdgarClient(settings) as client:
+        try:
+            downloaded = download_company(client, company, years=_SHOW_YEARS)
+        except IncompleteFilingIndexError as exc:
+            _fail(str(exc), code=1)
+    document = _pick_filing(downloaded.documents, company.ticker, fy)
+    return build_filing_text(document, company.name)
+
+
+def _span_texts(settings: Settings, accessions: set[str]) -> dict[str, str]:
+    """accession -> normalized filing text, loading only the companies needed."""
+    model = _embedding_model(settings)
+    manifest = read_manifest(manifest_path(settings.manifests_dir, "item_aware", model.cache_key))
+    ticker_of = {r.accession: r.ticker for r in manifest}
+    texts: dict[str, str] = {}
+    for ticker in sorted({ticker_of[a] for a in accessions}):
+        company = Corpus.load(settings.corpus_path).by_ticker(ticker)
+        with EdgarClient(settings) as client:
+            downloaded = download_company(client, company, years=_SHOW_YEARS)
+        for document in downloaded.documents:
+            if document.ref.accession in accessions:
+                texts[document.ref.accession] = build_filing_text(document, company.name).text
+    return texts
+
+
+# --- entry point ------------------------------------------------------------------
+# Last in the file on purpose: `python -m filing_copilot.cli` runs this block as soon
+# as it is reached, so every @app.command above must already be registered.
+
+
+def main() -> None:  # pragma: no cover - thin wrapper
+    sys.exit(app())
+
+
+if __name__ == "__main__":  # pragma: no cover
+    main()

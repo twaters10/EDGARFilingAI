@@ -86,6 +86,10 @@ class Settings(BaseSettings):
         default=None,
         description="Override the packaged concepts.yaml. Unset uses the shipped file.",
     )
+    retrieval_evals_dir: Path = Field(
+        default=Path("evals/retrieval"),
+        description="Questions, gold spans, judgments and failure tags for the retrieval eval.",
+    )
 
     # --- AWS (unused until Stage 8; declared so nothing is ever hardcoded) --
     aws_region: str | None = None
@@ -133,6 +137,11 @@ class Settings(BaseSettings):
     def embeddings_dir(self) -> Path:
         """Root of the embedding cache: one directory of Parquet parts per model."""
         return self.processed_dir / "embeddings"
+
+    @property
+    def eval_runs_dir(self) -> Path:
+        """Per-question results of every ``fc eval-retrieval`` run. Regenerable; not committed."""
+        return self.processed_dir / "eval"
 
     @property
     def manifests_dir(self) -> Path:

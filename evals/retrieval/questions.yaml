@@ -1,0 +1,366 @@
+# Retrieval eval questions -- written BEFORE any search code runs against them.
+#
+# Discipline (PROJECT_PLAN.txt:802): a question written after watching the retriever
+# fail is a question shaped by that failure. Write these from the personas, not from
+# search results, and record `written_on` so the order is on the record.
+#
+# The corpus these must be answerable from (config/corpus.yaml):
+#   * 10-K only, fiscal years 2023, 2024, 2025. No 10-Qs, no 8-Ks, no proxies.
+#   * 20 filers: COF SYF AXP BFH ALLY SOFI (card / consumer) · JPM BAC C WFC
+#     (money-center) · USB PNC TFC RF FITB CFG (regional) · V MA (networks) ·
+#     JEF (investment bank) · AAPL (non-financial contrast)
+#   * Sectioned items: 1 1A 1B 1C 2 3 5 7 7A 8 9A
+#
+# ---------------------------------------------------------------------------------
+# SCHEMA -- one entry per question under `questions:`
+#
+#   id          str       stable, never reused: r001, r002, ...
+#   question    str       exactly as a user would type it
+#   persona     enum      credit_risk | card_intelligence | model_risk | aml
+#   archetype   enum      lexical     -- hinges on an exact term, name, or item number
+#                         semantic    -- the answer uses different words than the question
+#                         entity      -- names one company (and often a year)
+#                         peer        -- spans several companies; coverage matters
+#   scope       map       what the question itself names; empty map if nothing.
+#                           tickers: [SYF]   fiscal_years: [2024]   items: ["9A"]
+#                         Recorded, NOT applied, through Phases 4-5: the query runs
+#                         unfiltered so the eval sees what the raw retriever does.
+#                         Phase 6 re-runs with scope applied as filters.
+#   split       enum      dev | blind. ~20% blind, chosen before any run, run once.
+#   written_on  date      YYYY-MM-DD
+#   gold        list      EMPTY until Phase 4 (`fc label-span`). Each entry:
+#                           accession, document, char_start, char_end,
+#                           grade (1|2), source (initial|adjudicated), note
+#   notes       str       optional: what a good answer contains, in your words
+#
+# TARGET MIX for ~30 (a guide, not a quota):
+#   lexical 7 · semantic 7 · entity 10 · peer 6
+#   and across personas, weighted to credit_risk and card_intelligence
+#
+# EXAMPLE -- illustrative only, kept in a comment so no loader ever reads it:
+#
+#   - id: r000
+#     question: "What did Synchrony disclose about customer concentration risk?"
+#     persona: credit_risk
+#     archetype: entity
+#     scope: {tickers: [SYF], fiscal_years: [2024], items: ["1A"]}
+#     split: dev
+#     written_on: 2026-09-24
+#     gold: []
+#     notes: "Dependence on a few retail partners; names the largest program(s)."
+# ---------------------------------------------------------------------------------
+
+# r001-r010 were drafted by Claude at the operator's request on 2026-09-24, before any
+# search code existed, then reviewed by the operator. Edit or delete freely; every kept
+# entry is the operator's call.
+#
+# Blind split: r006, r009, r014, r015, r017, r025 -- drawn 2026-09-24 by seeded random sample
+# (seed 20260924), 20% per archetype, before any search code existed. Not hand-picked,
+# so no guess about which questions are hard leaked into the choice. Run once, at the end.
+# 2026-09-24: r001 moved to dev so it can serve as a Phase 1 probe; its replacement,
+# r006, was drawn from the remaining dev entity questions with the same seed.
+
+questions:
+  - id: r001
+    question: "What did Synchrony disclose about customer concentration risk?"
+    persona: credit_risk
+    archetype: entity
+    scope: {tickers: [SYF], fiscal_years: [2024], items: ["1A"]}
+    split: dev
+    written_on: 2026-09-24
+    gold: []
+    notes: "Dependence on a few retail partners; names the largest program(s)."
+
+  - id: r002
+    question: "Did any company report a material weakness in internal control over financial reporting?"
+    persona: model_risk
+    archetype: lexical
+    scope: {items: ["9A"]}
+    split: dev
+    written_on: 2026-09-24
+    gold: []
+    notes: "Exact regulatory phrase. A credible 'none found' is also an answer -- see rubric edge case 6."
+
+  - id: r003
+    question: "How does Capital One describe its CECL allowance methodology?"
+    persona: credit_risk
+    archetype: lexical
+    scope: {tickers: [COF], items: ["7"]}
+    split: dev
+    written_on: 2026-09-24
+    gold: []
+    notes: "Acronym-dependent. Reasonable and supportable forecast period, reversion, qualitative factors."
+
+  - id: r004
+    question: "How does Ally expect its credit losses to behave if the economy weakens?"
+    persona: credit_risk
+    archetype: semantic
+    scope: {tickers: [ALLY], items: ["7"]}
+    split: dev
+    written_on: 2026-09-24
+    gold: []
+    notes: "Filing wording differs from the question: macroeconomic scenarios, unemployment, sensitivity of the allowance."
+
+  - id: r005
+    question: "What would happen to Bread Financial if one of its biggest retail partners walked away?"
+    persona: card_intelligence
+    archetype: semantic
+    scope: {tickers: [BFH], items: ["1A"]}
+    split: dev
+    written_on: 2026-09-24
+    gold: []
+    notes: "Filing says 'brand partners', 'non-renewal', 'loss of a significant partner' -- not 'walked away'."
+
+  - id: r006
+    question: "What does JPMorgan say about its anti-money laundering and sanctions compliance obligations?"
+    persona: aml
+    archetype: entity
+    scope: {tickers: [JPM]}
+    split: blind
+    written_on: 2026-09-24
+    gold: []
+    notes: "Likely in Item 1 (supervision and regulation) and Item 1A. BSA/AML, OFAC."
+
+  - id: r007
+    question: "What does PNC say could go wrong with the models it relies on to run the business?"
+    persona: model_risk
+    archetype: semantic
+    scope: {tickers: [PNC], items: ["1A"]}
+    split: dev
+    written_on: 2026-09-24
+    gold: []
+    notes: "Filing wording is 'model risk', 'assumptions', 'inaccurate estimates' -- the question never says 'model risk'."
+
+  - id: r008
+    question: "How do American Express, Capital One, and Synchrony describe competition for card customers?"
+    persona: card_intelligence
+    archetype: peer
+    scope: {tickers: [AXP, COF, SYF], items: ["1"]}
+    split: dev
+    written_on: 2026-09-24
+    gold: []
+    notes: "Coverage question: a good result set has all three issuers, not the loudest one."
+
+  - id: r009
+    question: "What do the largest banks disclose about AML-related consent orders or enforcement actions?"
+    persona: aml
+    archetype: peer
+    scope: {tickers: [JPM, BAC, C, WFC]}
+    split: blind
+    written_on: 2026-09-24
+    gold: []
+    notes: "Some filers may have nothing current -- per-company negatives are part of the answer."
+
+  - id: r010
+    question: "How does Visa describe the risk from interchange fee regulation?"
+    persona: card_intelligence
+    archetype: entity
+    scope: {tickers: [V], fiscal_years: [2025], items: ["1A"]}
+    split: dev
+    written_on: 2026-09-24
+    gold: []
+    notes: "Visa's fiscal year ends in September. Durbin Amendment, EU caps, litigation over rates."
+
+  # --- r011-r030: drafted by Claude at the operator's request, 2026-09-24 ---------------
+  # Filled to the target mix (lexical 5, semantic 4, entity 7, peer 4) and toward filers
+  # and topics r001-r010 did not touch. Placeholders until the operator writes their own.
+
+  - id: r011
+    question: "What does Fifth Third disclose about its exposure to commercial real estate office loans?"
+    persona: credit_risk
+    archetype: lexical
+    scope: {tickers: [FITB], items: ["7"]}
+    split: dev
+    written_on: 2026-09-24
+    gold: []
+    notes: "Hinges on 'CRE' / 'office'. Portfolio size, criticized loans, reserves on office."
+
+  - id: r012
+    question: "Which companies discuss the Basel III endgame capital proposal?"
+    persona: model_risk
+    archetype: lexical
+    scope: {}
+    split: dev
+    written_on: 2026-09-24
+    gold: []
+    notes: "Named proposal. Coverage matters: several banks mention it, non-banks should not."
+
+  - id: r013
+    question: "What does Citigroup say about its consent orders with the OCC and Federal Reserve?"
+    persona: model_risk
+    archetype: lexical
+    scope: {tickers: [C]}
+    split: dev
+    written_on: 2026-09-24
+    gold: []
+    notes: "2020 consent orders on risk management and data governance; remediation progress."
+
+  - id: r014
+    question: "How is the CFPB credit card late fee rule expected to affect revenue?"
+    persona: card_intelligence
+    archetype: lexical
+    scope: {items: ["1A", "7"]}
+    split: blind
+    written_on: 2026-09-24
+    gold: []
+    notes: "Named rule. Finalized 2024, later vacated -- FY2025 wording may differ from FY2024."
+
+  - id: r015
+    question: "What does Item 1C say about American Express's cybersecurity risk management?"
+    persona: model_risk
+    archetype: lexical
+    scope: {tickers: [AXP], items: ["1C"]}
+    split: blind
+    written_on: 2026-09-24
+    gold: []
+    notes: "Item-number query. Governance, CISO, board oversight, third-party risk."
+
+  - id: r016
+    question: "Could Citizens Financial be hurt if a lot of depositors pulled their money out at once?"
+    persona: credit_risk
+    archetype: semantic
+    scope: {tickers: [CFG], items: ["1A"]}
+    split: dev
+    written_on: 2026-09-24
+    gold: []
+    notes: "Filing says 'deposit outflows', 'liquidity risk', 'uninsured deposits' -- not 'pulled their money'."
+
+  - id: r017
+    question: "How does U.S. Bancorp say rising interest rates changed the value of its bond holdings?"
+    persona: credit_risk
+    archetype: semantic
+    scope: {tickers: [USB], items: ["7"]}
+    split: blind
+    written_on: 2026-09-24
+    gold: []
+    notes: "Filing says 'unrealized losses', 'investment securities', 'AOCI' -- not 'bond holdings'."
+
+  - id: r018
+    question: "What does SoFi say are the upsides and downsides of owning its own bank?"
+    persona: card_intelligence
+    archetype: semantic
+    scope: {tickers: [SOFI], items: ["1", "1A"]}
+    split: dev
+    written_on: 2026-09-24
+    gold: []
+    notes: "Bank charter / SoFi Bank: deposit funding vs regulatory supervision and capital."
+
+  - id: r019
+    question: "How does Mastercard try to stop criminals from using its network to move dirty money?"
+    persona: aml
+    archetype: semantic
+    scope: {tickers: [MA], items: ["1", "1A"]}
+    split: dev
+    written_on: 2026-09-24
+    gold: []
+    notes: "Filing says 'anti-money laundering', 'sanctions', 'financial crime' -- not 'dirty money'."
+
+  - id: r020
+    question: "What does Bank of America say drove changes in its allowance for credit losses in 2024?"
+    persona: credit_risk
+    archetype: entity
+    scope: {tickers: [BAC], fiscal_years: [2024], items: ["7"]}
+    split: dev
+    written_on: 2026-09-24
+    gold: []
+    notes: "Narrative drivers only (portfolio mix, macro outlook, card losses); figures come from SQL."
+
+  - id: r021
+    question: "How does Wells Fargo describe the asset cap imposed by the Federal Reserve?"
+    persona: credit_risk
+    archetype: entity
+    scope: {tickers: [WFC], fiscal_years: [2024]}
+    split: dev
+    written_on: 2026-09-24
+    gold: []
+    notes: "2018 consent order limiting total assets. FY2024 names the year: rubric case 2 applies."
+
+  - id: r022
+    question: "What does Jefferies disclose about anti-money laundering obligations in its broker-dealer business?"
+    persona: aml
+    archetype: entity
+    scope: {tickers: [JEF], items: ["1", "1A"]}
+    split: dev
+    written_on: 2026-09-24
+    gold: []
+    notes: "Rubric case 7 applies: generic BSA description is 1, JEF-specific program text is 2."
+
+  - id: r023
+    question: "What does Apple disclose about credit risk from its customers and counterparties?"
+    persona: credit_risk
+    archetype: entity
+    scope: {tickers: [AAPL], items: ["7A", "8"]}
+    split: dev
+    written_on: 2026-09-24
+    gold: []
+    notes: "Contrast filer. Trade and vendor receivables, derivative counterparties -- not lending."
+
+  - id: r024
+    question: "How does Capital One describe its planned acquisition of Discover and the reasons for it?"
+    persona: card_intelligence
+    archetype: entity
+    scope: {tickers: [COF], fiscal_years: [2024], items: ["1", "7"]}
+    split: dev
+    written_on: 2026-09-24
+    gold: []
+    notes: "Announced 2024. Network ownership, scale, regulatory approval risk."
+
+  - id: r025
+    question: "How does Synchrony describe the use of models in estimating its allowance for credit losses?"
+    persona: model_risk
+    archetype: entity
+    scope: {tickers: [SYF], items: ["7"]}
+    split: blind
+    written_on: 2026-09-24
+    gold: []
+    notes: "Critical accounting estimates: loss forecasting models, macro scenarios, qualitative overlays."
+
+  - id: r026
+    question: "How does American Express describe competition from newer payment options like buy now, pay later?"
+    persona: card_intelligence
+    archetype: entity
+    scope: {tickers: [AXP], items: ["1", "1A"]}
+    split: dev
+    written_on: 2026-09-24
+    gold: []
+    notes: "Alternative payments, fintechs, BNPL. May be a single mention -- short gold is fine."
+
+  - id: r027
+    question: "How are the regional banks managing their exposure to commercial real estate office loans?"
+    persona: credit_risk
+    archetype: peer
+    scope: {tickers: [USB, PNC, TFC, RF, FITB, CFG]}
+    split: dev
+    written_on: 2026-09-24
+    gold: []
+    notes: "Peer twin of r011. Coverage across six regionals is the test."
+
+  - id: r028
+    question: "How do Visa and Mastercard describe the litigation over interchange fees?"
+    persona: card_intelligence
+    archetype: peer
+    scope: {tickers: [V, MA]}
+    split: dev
+    written_on: 2026-09-24
+    gold: []
+    notes: "Two-filer peer set. Merchant class actions, settlement status. Visa FYE is September."
+
+  - id: r029
+    question: "How do the largest banks describe their use of artificial intelligence and the risks it brings?"
+    persona: model_risk
+    archetype: peer
+    scope: {tickers: [JPM, BAC, C, WFC], items: ["1A"]}
+    split: dev
+    written_on: 2026-09-24
+    gold: []
+    notes: "Newer disclosure. FY2023 may say little; FY2025 more -- expect uneven gold across years."
+
+  - id: r030
+    question: "What do SoFi, Ally, and Capital One say about BSA/AML compliance risk?"
+    persona: aml
+    archetype: peer
+    scope: {tickers: [SOFI, ALLY, COF]}
+    split: dev
+    written_on: 2026-09-24
+    gold: []
+    notes: "Rubric case 7 applies. A bank-charter fintech next to two established lenders."

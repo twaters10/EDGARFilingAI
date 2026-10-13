@@ -1,0 +1,9 @@
+# Written by `fc adjudicate` -- do not edit by hand while a session is running.
+#
+# Blind judgments of pooled retrieval hits: every configuration's top-k for a
+# question, deduplicated, shuffled, and shown WITHOUT the system that found it.
+# Grades follow RUBRIC.md. Grade 0 is a judged negative, recorded so the same hit
+# is never asked about twice and so unjudged@10 can reach zero. Grades 1-2 are
+# merged into the question's gold at load time (source: adjudicated).
+
+judgments: []

@@ -1,4 +1,4 @@
-"""A deliberately small OpenSearch client: five REST calls over ``httpx``.
+"""A deliberately small OpenSearch client: six REST calls over ``httpx``.
 
 **Tradeoff, stated:** ``opensearch-py`` would do all of this, plus SigV4 request
 signing for Stage 8. It is not used here because the point of Stage 3 is to see
@@ -31,7 +31,7 @@ class OpenSearchError(RuntimeError):
 
 
 class OpenSearchClient:
-    """Index lifecycle and bulk loading. Search arrives in Stage 4."""
+    """Index lifecycle, bulk loading, and search."""
 
     def __init__(
         self,
@@ -100,6 +100,15 @@ class OpenSearchClient:
 
     def count(self, name: str) -> int:
         return int(self._request("GET", f"{name}/_count")["count"])
+
+    def search(self, name: str, body: Mapping[str, Any]) -> dict[str, Any]:
+        """Run a query-DSL ``body`` against ``name`` and return the raw response.
+
+        Deliberately returns the response untouched: what a query *is* (kNN, BM25)
+        lives in :mod:`filing_copilot.retrieval.search`, next to the code that reads
+        the hits back, so the request and its interpretation are read together.
+        """
+        return self._request("POST", f"{name}/_search", json=body)
 
     # --- transport ------------------------------------------------------------
 

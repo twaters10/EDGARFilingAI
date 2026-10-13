@@ -1,0 +1,26 @@
+# Error analysis -- written by the operator, by hand.
+#
+# `fc eval-retrieval` lists every question a hybrid configuration missed
+# (recall@10 < 1 or MRR < 0.5) that has no tag here yet. For each, read what came
+# back (the per-question CSV names the chunk_ids) and record WHY, using one cause
+# from this fixed taxonomy -- fixed so counts compare across runs:
+#
+#   lexical_miss           the answer uses a term the retriever did not match
+#   semantic_miss          the answer paraphrases; no shared words, meaning missed
+#   wrong_entity           right topic, wrong company
+#   wrong_period           right topic and company, wrong fiscal year
+#   chunk_boundary_split   the answer is split across chunks; neither covers enough
+#   table_text             the answer is in a table (placeholder text in the index)
+#   boilerplate_outranked  generic text any filer carries ranked above the answer
+#   label_error            the gold is wrong or incomplete -- fix the label, not the system
+#
+# The table of cause x configuration this produces -- not the average -- decides
+# what to change next. Change one thing, rerun the dev split, record the delta.
+#
+# Entry shape:
+#   - question: r004
+#     cause: semantic_miss
+#     config: hybrid/item_aware     # or "all" (the default)
+#     note: "filing says 'macroeconomic scenarios'; top hits were rate-risk boilerplate"
+
+failures: []
